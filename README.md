@@ -242,6 +242,28 @@ bun test tests/sync.test.js
 
 完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
+## 仓库与版本
+
+- Gitea 仓库：<http://192.168.254.253:60006/admin/WebDAVrSync>
+- Releases 页面提供每个版本的插件包（`.zip`）与说明：
+  <http://192.168.254.253:60006/admin/WebDAVrSync/releases>
+- 版本标签：`v1.0.0`、`v1.1.0`、`v1.2.0`
+
+安装（其他机器）：
+
+1. 在 Releases 下载对应版本的 `WebDAVrSync-<版本>.zip`；
+2. 解压后把 `webdavrsync` 文件夹复制到 `<仓库>/.obsidian/plugins/`；
+3. 重启 Obsidian，在“第三方插件”里启用 WebDAVrSync。
+
+也可以直接克隆源码：
+
+```bash
+git clone http://192.168.254.253:60006/admin/WebDAVrSync.git
+# 把仓库内容复制到 <仓库>/.obsidian/plugins/webdavrsync/
+```
+
+源码仓库包含全部历史版本与 `tests/sync.test.js`（需要 [Bun](https://bun.sh) 运行）。
+
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
