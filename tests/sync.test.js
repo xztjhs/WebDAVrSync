@@ -440,9 +440,10 @@ class MemoryAdapter {
   async stat(path) {
     const entry = this.entries.get(this.path(path));
     if (!entry) throw new Error('ENOENT: ' + path);
+    const isDir = entry.isDir && entry.link !== 'dir-lstat';
     return {
-      type: entry.isDir ? 'folder' : 'file',
-      size: entry.isDir ? 0 : entry.data.byteLength,
+      type: isDir ? 'folder' : 'file',
+      size: isDir || !entry.data ? 0 : entry.data.byteLength,
       mtime: entry.mtime,
       ctime: entry.mtime,
     };
@@ -457,7 +458,7 @@ class MemoryAdapter {
       if (!key || key === base || !key.startsWith(prefix)) continue;
       const rest = key.slice(prefix.length);
       if (!rest || rest.includes('/')) continue;
-      if (entry.isDir) folders.push(key);
+      if (entry.isDir && !entry.alias) folders.push(key);
       else files.push(key);
     }
     return { files, folders };
@@ -465,7 +466,13 @@ class MemoryAdapter {
 
   async readBinary(path) {
     const entry = this.entries.get(this.path(path));
-    if (!entry || entry.isDir) throw new Error('ENOENT: ' + path);
+    if (!entry) throw new Error('ENOENT: ' + path);
+    if (entry.isDir) {
+      if (entry.link === 'dir-lstat') {
+        throw new Error('EISDIR: illegal operation on a directory, read');
+      }
+      throw new Error('ENOENT: ' + path);
+    }
     return entry.data.slice().buffer;
   }
 
@@ -523,6 +530,19 @@ class MemoryAdapter {
 
   async writeText(path, text) {
     await this.writeBinary(path, new TextEncoder().encode(text).buffer);
+  }
+
+  // 模拟目录软链接：列目录时表现为“文件”。
+  // statIsFolder=true  → stat 报告“目录”；false → stat 报告“文件”（lstat 语义）。
+  async writeAlias(path, statIsFolder) {
+    const key = this.path(path);
+    this.ensureParents(key);
+    this.entries.set(key, {
+      isDir: true,
+      alias: true,
+      link: statIsFolder === false ? 'dir-lstat' : 'dir',
+      mtime: Date.now(),
+    });
   }
 
   readText(path) {
@@ -942,6 +962,128 @@ describe('WebDAVrSync', () => {
     await expect(runSync(adapter, settings, state)).rejects.toThrow(/认证失败/);
   });
 
+  it('回收站内容默认同步到 WebDAV，删除后内容不会彻底丢失', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.writeText('.trash/deleted.md', 'deleted content');
+    const settings = makeSettings(server);
+
+    const result = await runSync(adapter, settings, newState());
+
+    expect(result.summary.errors).toEqual([]);
+    expect(result.summary.uploaded).toBe(1);
+    expect(server.getFile('vault/.trash/deleted.md')).toBeTruthy();
+  });
+
+  it('关闭“同步回收站”后回收站内容不再上传', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.writeText('.trash/deleted.md', 'deleted content');
+    const settings = makeSettings(server, { syncTrash: false });
+
+    const result = await runSync(adapter, settings, newState());
+
+    expect(result.summary.uploaded).toBe(0);
+    expect(server.getFile('vault/.trash/deleted.md')).toBeUndefined();
+  });
+
+  it('忽略规则里的 .trash 写法不会覆盖“同步回收站”开关', () => {
+    const on = compileIgnore({ syncTrash: true, ignoreText: '.trash/**' });
+    expect(on('.trash/x.md')).toBe(false);
+    const off = compileIgnore({ syncTrash: false, ignoreText: '' });
+    expect(off('.trash/x.md')).toBe(true);
+  });
+
+  it('本地空目录会在 WebDAV 上建立同名目录', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.mkdir('营销/客户');
+    const settings = makeSettings(server);
+
+    const result = await runSync(adapter, settings, newState());
+
+    expect(result.summary.errors).toEqual([]);
+    expect(result.summary.dirsCreated).toBeGreaterThan(0);
+    expect(server.getFile('vault/营销/客户')).toBeTruthy();
+    expect(server.getFile('vault/营销/客户').isDir).toBe(true);
+  });
+
+  it('关闭“同步空目录”后不创建远端目录', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.mkdir('空目录');
+    const settings = makeSettings(server, { syncEmptyDirs: false });
+
+    const result = await runSync(adapter, settings, newState());
+
+    expect(result.summary.dirsCreated).toBe(0);
+    expect(server.getFile('vault/空目录')).toBeUndefined();
+  });
+
+  it('符号链接目录不会被上传，远端副本不会被自动删除', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    // 远端已有历史残留
+    server.setFile('vault/alias/old.md', 'stale');
+    // 本地是一个指向别处的目录软链接
+    await adapter.writeAlias('alias');
+
+    const settings = makeSettings(server);
+    const state = newState();
+
+    const result = await runSync(adapter, settings, state);
+
+    expect(result.summary.errors).toEqual([]);
+    expect(result.summary.uploaded).toBe(0);
+    expect(result.summary.downloaded).toBe(0);
+    // 远端副本保持原样：本地通过软链接仍能访问，删掉等于丢内容
+    expect(result.summary.deletedRemote).toBe(0);
+    expect(server.getFile('vault/alias/old.md')).toBeTruthy();
+    expect(adapter.files()).not.toContain('alias');
+  });
+
+  it('stat 把软链接当文件时，靠远端同路径是目录也能识别出别名', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    server.setFile('vault/alias/old.md', 'stale');
+    // stat 报告“文件”（部分平台对符号链接就是 lstat 语义）
+    await adapter.writeAlias('alias', false);
+
+    const settings = makeSettings(server);
+    const result = await runSync(adapter, settings, newState());
+
+    expect(result.summary.errors).toEqual([]);
+    expect(result.summary.uploaded).toBe(0);
+    expect(result.summary.downloaded).toBe(0);
+    expect(result.summary.deletedRemote).toBe(0);
+    expect(server.getFile('vault/alias/old.md')).toBeTruthy();
+  });
+
+  it('本地 mtime 带亚毫秒小数时不会重复上传', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.writeText('a.md', 'v1');
+    const settings = makeSettings(server);
+    const state = newState();
+
+    const first = await runSync(adapter, settings, state);
+    expect(first.summary.uploaded).toBe(1);
+
+    // 模拟文件系统返回带小数的 mtime（与状态表里记录的整数值只差不到 1ms）
+    adapter.setMtime('a.md', adapter.entries.get('a.md').mtime + 0.37);
+
+    const second = await runSync(adapter, settings, state);
+    expect(second.summary.uploaded).toBe(0);
+    expect(second.summary.errors).toEqual([]);
+  });
+
   it('插件 onload/onunload 冒烟测试', async () => {
     const app = {
       vault: {
@@ -956,7 +1098,8 @@ describe('WebDAVrSync', () => {
     };
     const plugin = new WebDAVrSyncPlugin(app, { id: 'webdavrsync' });
     await plugin.onload();
-    expect(plugin.commands.length).toBe(2);
+    expect(plugin.commands.length).toBe(3);
+    expect(plugin.commands.map((command) => command.id)).toContain('backup-now');
     expect(plugin.statusBarEl.textContent).toContain('WebDAVrSync');
     plugin.onunload();
   });

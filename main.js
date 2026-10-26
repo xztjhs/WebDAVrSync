@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * WebDAVrSync 1.2.0
+ * WebDAVrSync 1.2.1
  * A small, dependency-free, open-source Obsidian plugin that synchronizes a
  * vault with any WebDAV server that supports PROPFIND / PUT / GET / MKCOL /
  * DELETE (for example SFTPGo, Nextcloud, ownCloud, Apache mod_dav, nginx-dav).
@@ -24,7 +24,7 @@ const {
 } = require('obsidian');
 
 const PLUGIN_ID = 'webdavrsync';
-const PLUGIN_VERSION_FALLBACK = '1.2.0';
+const PLUGIN_VERSION_FALLBACK = '1.2.1';
 const STATE_VERSION = 1;
 const CONFIG_FORMAT = 'webdavrsync-config';
 const CONFIG_FORMAT_VERSION = 1;
@@ -63,7 +63,7 @@ const DEFAULT_IGNORE_TEXT = [
   '.obsidian/plugins/webdavrsync/**',
   '.webdavrsync-backups/**',
   '**/*.pre-restore-*.bak',
-  '.trash/**',
+  '# 回收站（.trash）默认也要同步，由设置里的“同步回收站”开关统一控制',
   '**/.git/**',
   '**/node_modules/**',
   '**/.DS_Store',
@@ -86,6 +86,11 @@ const DEFAULT_SETTINGS = {
   syncConfig: false,
   verifyContent: true,
   ignoreText: DEFAULT_IGNORE_TEXT,
+  // 回收站内容一并备份：否则“远端删除 → 本地移入回收站 → 回收站被忽略”
+  // 会让文件在本地和远端同时消失，内容永远无法找回。
+  syncTrash: true,
+  // 同步空目录结构，让 WebDAV 浏览器里的目录层级与本地仓库保持一致。
+  syncEmptyDirs: true,
   backupFolder: '.webdavrsync-backups',
   backupKeep: 10,
   backupIncludePluginCode: false,
@@ -216,6 +221,15 @@ function normalizeEtag(etag) {
     .replace(/^"|"$/g, '');
 }
 
+// 文件系统返回的 mtime 可能带亚毫秒小数（不同平台精度不同），
+// 直接用 !== 比较会让同一份文件每次同步都被判定为“本地已修改”，
+// 从而无休止地重复上传。统一取整后再比较。
+function normalizeMtime(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n);
+}
+
 function equalBytes(a, b) {
   if (!a || !b) return false;
   const ua = a instanceof Uint8Array ? a : new Uint8Array(a);
@@ -276,16 +290,34 @@ function globToRegExps(pattern) {
   return regexes;
 }
 
+// 回收站规则由 syncTrash 设置统一控制，忽略规则不再重复管理，
+// 避免“设置里开着、忽略规则里又写着”两处互相打架。
+function isTrashPattern(pattern) {
+  const p = String(pattern || '')
+    .trim()
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '');
+  return p === '.trash' || p === '.trash/*' || p === '.trash/**';
+}
+
 function compileIgnore(settings) {
   const regexes = [];
   const add = (pattern) => {
     for (const re of globToRegExps(pattern)) regexes.push(re);
   };
 
+  const syncTrash = settings.syncTrash !== false;
+
   for (const line of String(settings.ignoreText || '').split(/\r?\n/)) {
     const pattern = line.trim();
     if (!pattern || pattern.startsWith('#')) continue;
+    if (syncTrash && isTrashPattern(pattern)) continue;
     add(pattern);
+  }
+
+  if (!syncTrash) {
+    add('.trash');
+    add('.trash/**');
   }
 
   if (!settings.syncConfig) {
@@ -343,6 +375,8 @@ function normalizeSettings(input) {
     conflictStrategy: merged.conflictStrategy === 'newest' ? 'newest' : 'keep-both',
     syncConfig: toBoolean(merged.syncConfig, DEFAULT_SETTINGS.syncConfig),
     verifyContent: toBoolean(merged.verifyContent, DEFAULT_SETTINGS.verifyContent),
+    syncTrash: toBoolean(merged.syncTrash, DEFAULT_SETTINGS.syncTrash),
+    syncEmptyDirs: toBoolean(merged.syncEmptyDirs, DEFAULT_SETTINGS.syncEmptyDirs),
     ignoreText:
       typeof merged.ignoreText === 'string' ? merged.ignoreText : DEFAULT_SETTINGS.ignoreText,
     backupFolder:
@@ -729,6 +763,7 @@ function formatSummary(summary) {
   const parts = [];
   if (summary.uploaded) parts.push('↑' + summary.uploaded);
   if (summary.downloaded) parts.push('↓' + summary.downloaded);
+  if (summary.dirsCreated) parts.push('建目录 ' + summary.dirsCreated);
   if (summary.deletedRemote) parts.push('远端删除 ' + summary.deletedRemote);
   if (summary.deletedLocal) parts.push('本地删除 ' + summary.deletedLocal);
   if (summary.conflicts) parts.push('冲突 ' + summary.conflicts);
@@ -1118,10 +1153,15 @@ class SyncEngine {
     this.trashLocal = options.trashLocal || ((path) => this.adapter.remove(path));
     this.log = options.log || (() => {});
     this.isIgnored = compileIgnore(options.settings);
+    this.isAliasPath = () => false;
+    this.localAliasDirs = new Set();
+    this.localDirs = new Set();
+    this.localEmptyDirs = new Set();
     this.remote = new Map();
     this.summary = {
       uploaded: 0,
       downloaded: 0,
+      dirsCreated: 0,
       deletedLocal: 0,
       deletedRemote: 0,
       conflicts: 0,
@@ -1150,9 +1190,59 @@ class SyncEngine {
       skipDir: (path) => this.isIgnored(path),
       concurrency: 4,
     });
+
+    const aliasDirs = this.localAliasDirs || new Set();
+
+    // 远端目录索引。本地把某个路径当成“文件”，而远端同路径是目录，
+    // 说明本地这一项其实是目录软链接（别名）：它不是真实文件，无法同步。
+    // 标记出来：不上传、不下载，并清理远端对应的历史残留。
+    const remoteDirs = new Set();
+    for (const [path, entry] of remoteAll) {
+      if (entry.isDir) remoteDirs.add(path);
+    }
+    for (const path of Array.from(local.keys())) {
+      if (remoteDirs.has(path)) {
+        local.delete(path);
+        aliasDirs.add(path);
+        this.log('检测到目录软链接，跳过：' + path);
+      }
+    }
+
+    const isAliasPath = (path) => {
+      if (!aliasDirs.size) return false;
+      if (aliasDirs.has(path)) return true;
+      for (const dir of aliasDirs) {
+        if (path.startsWith(dir + '/')) return true;
+      }
+      return false;
+    };
+    this.isAliasPath = isAliasPath;
+
     this.remote = new Map();
     for (const [path, entry] of remoteAll) {
-      if (!entry.isDir && !this.isIgnored(path)) this.remote.set(path, entry);
+      if (entry.isDir || this.isIgnored(path)) continue;
+      if (isAliasPath(path)) continue;
+      this.remote.set(path, entry);
+    }
+
+    // 让 WebDAV 上的目录结构与本地仓库保持一致（含空目录）
+    if (this.settings.syncEmptyDirs !== false) {
+      const dirs = this.localDirs || new Set();
+      for (const dir of dirs) {
+        if (!dir || this.isIgnored(dir)) continue;
+        if (this.client.dirCache.has(dir)) continue;
+        try {
+          await this.client.ensureDir(dir);
+          this.summary.dirsCreated++;
+        } catch (error) {
+          this.summary.errors.push({
+            path: dir,
+            message:
+              '创建远端目录失败：' +
+              (error && error.message ? error.message : String(error)),
+          });
+        }
+      }
     }
 
     // Drop state for paths that are now ignored.
@@ -1197,6 +1287,20 @@ class SyncEngine {
       if (done % 100 === 0) await this.onPersist();
     }
 
+    // 符号链接目录：本地没有可同步的真实文件，远端同名内容无法维护。
+    // 只跳过并清掉状态记录，不删除远端文件——本地通过软链接仍能访问这些内容，
+    // 自动删掉等于把备份里的内容弄丢。
+    if (aliasDirs.size) {
+      for (const [path, entry] of remoteAll) {
+        if (entry.isDir || this.isIgnored(path)) continue;
+        if (!isAliasPath(path)) continue;
+        delete this.state.files[path];
+      }
+      for (const dir of aliasDirs) {
+        this.log('已跳过目录软链接（远端同名副本保持原样）：' + dir);
+      }
+    }
+
     this.state.version = STATE_VERSION;
     this.state.lastSync = Date.now();
     await this.onPersist();
@@ -1208,6 +1312,12 @@ class SyncEngine {
     const files = new Map();
     const directories = [''];
     const allFiles = [];
+    const allDirs = new Set();
+    const rawFiles = [];
+    const aliasDirs = new Set();
+
+    this.localAliasDirs = aliasDirs;
+    this.localDirs = allDirs;
 
     while (directories.length) {
       const dir = directories.pop();
@@ -1222,9 +1332,11 @@ class SyncEngine {
         throw new Error('无法读取本地目录 ' + (dir || '/') + '：' + message);
       }
       for (const folder of listing.folders || []) {
+        allDirs.add(folder);
         if (!this.isIgnored(folder)) directories.push(folder);
       }
       for (const file of listing.files || []) {
+        rawFiles.push(file);
         if (!this.isIgnored(file)) allFiles.push(file);
       }
     }
@@ -1237,7 +1349,13 @@ class SyncEngine {
         const file = allFiles[index];
         try {
           const stat = await this.adapter.stat(file);
-          if (stat && stat.type === 'folder') continue;
+          if (stat && stat.type === 'folder') {
+            // 目录软链接（例如 .opencode/skills/* -> copilot/skills/*）：
+            // 本地这一项不是一个真实文件，无法单独同步。记为别名目录，
+            // 远端同名内容属于历史残留，由清理流程处理。
+            aliasDirs.add(file);
+            continue;
+          }
           files.set(file, {
             path: file,
             size: Number(stat && stat.size) || 0,
@@ -1246,6 +1364,10 @@ class SyncEngine {
         } catch (error) {
           const message = error && error.message ? error.message : String(error);
           if (/ENOENT|no such file|not found/i.test(message)) continue;
+          if (/EISDIR|is a directory/i.test(message)) {
+            aliasDirs.add(file);
+            continue;
+          }
           throw new Error('无法读取本地文件信息 ' + file + '：' + message);
         }
       }
@@ -1253,7 +1375,39 @@ class SyncEngine {
     await Promise.all(
       Array.from({ length: Math.min(concurrency, allFiles.length || 1) }, () => worker())
     );
+
+    // 目录里只放着被忽略的文件时不算“空目录”，
+    // 否则 .obsidian/plugins/webdavrsync 这类目录会被创建到远端。
+    const dirsWithFiles = new Set();
+    for (const file of rawFiles) {
+      const parts = file.split('/');
+      parts.pop();
+      let current = '';
+      for (const part of parts) {
+        current = current ? current + '/' + part : part;
+        dirsWithFiles.add(current);
+      }
+    }
+    this.localEmptyDirs = new Set();
+    for (const dir of allDirs) {
+      if (!dirsWithFiles.has(dir) && !this.isIgnored(dir)) this.localEmptyDirs.add(dir);
+    }
+
     return files;
+  }
+
+  async readLocalFile(path) {
+    try {
+      return await this.adapter.readBinary(path);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      // 某些平台的 stat 会把目录软链接当成普通文件，这里读文件时才会暴露出来。
+      if (/EISDIR|is a directory/i.test(message)) {
+        if (this.localAliasDirs) this.localAliasDirs.add(path);
+        throw new SkipError('本地是目录软链接，跳过上传');
+      }
+      throw error;
+    }
   }
 
   async safeStat(path) {
@@ -1268,7 +1422,7 @@ class SyncEngine {
     if (!stateEntry) return true;
     if (!localEntry) return true;
     return (
-      Number(localEntry.mtime) !== Number(stateEntry.localMtime) ||
+      normalizeMtime(localEntry.mtime) !== normalizeMtime(stateEntry.localMtime) ||
       Number(localEntry.size) !== Number(stateEntry.localSize)
     );
   }
@@ -1291,7 +1445,7 @@ class SyncEngine {
   markSynced(path, localEntry, remoteEntry) {
     if (!this.state.files) this.state.files = {};
     this.state.files[normalizeRelPath(path)] = {
-      localMtime: Number(localEntry && localEntry.mtime) || 0,
+      localMtime: normalizeMtime(localEntry && localEntry.mtime),
       localSize: Number(localEntry && localEntry.size) || 0,
       remoteMtime: Number(remoteEntry && remoteEntry.mtime) || 0,
       remoteSize: Number(remoteEntry && remoteEntry.size) || 0,
@@ -1301,6 +1455,10 @@ class SyncEngine {
   }
 
   async syncOne(path, localEntry, remoteEntry) {
+    if (this.isAliasPath && this.isAliasPath(path)) {
+      this.summary.skipped++;
+      return;
+    }
     const stateEntry = this.state.files ? this.state.files[path] : null;
 
     if (!localEntry && !remoteEntry) {
@@ -1460,11 +1618,11 @@ class SyncEngine {
       const before = await this.safeStat(path);
       if (!before) throw new SkipError('本地文件已不存在');
 
-      const data = await this.adapter.readBinary(path);
+      const data = await this.readLocalFile(path);
       const after = await this.safeStat(path);
       if (!after) throw new SkipError('本地文件在读取过程中被删除');
       if (
-        Number(after.mtime) !== Number(before.mtime) ||
+        normalizeMtime(after.mtime) !== normalizeMtime(before.mtime) ||
         Number(after.size) !== Number(before.size) ||
         Number(data.byteLength) !== Number(after.size)
       ) {
@@ -1573,7 +1731,10 @@ class SyncEngine {
   }
 
   async deleteRemote(path, stateEntry) {
-    if (await this.adapter.exists(path)) {
+    // 本地仍然是“文件”时不能删远端；但如果本地这一项其实是个目录
+    // （常见于目录软链接），远端同名文件就是无法同步的历史残留，可以清理。
+    const localStat = await this.safeStat(path);
+    if (localStat && localStat.type !== 'folder') {
       throw new SkipError('本地文件仍然存在，跳过远端删除');
     }
     let remoteStat = null;
@@ -1667,6 +1828,7 @@ class WebDAVrSyncPlugin extends Plugin {
     this.pendingChange = false;
     this.unloaded = false;
     this.recentWrites = new Map();
+    this.lastBackup = null;
     this.intervalId = null;
     this.changeTimer = null;
     this.startupTimer = null;
@@ -1684,6 +1846,12 @@ class WebDAVrSyncPlugin extends Plugin {
       id: 'sync-now',
       name: '立即同步',
       callback: () => this.runSync(true),
+    });
+
+    this.addCommand({
+      id: 'backup-now',
+      name: '创建并上传加密备份',
+      callback: () => this.createEncryptedBackup(),
     });
     this.addCommand({
       id: 'test-connection',
@@ -2463,8 +2631,30 @@ class WebDAVrSyncPlugin extends Plugin {
       bytes.byteOffset + bytes.byteLength
     );
     await client.put(path, data);
+
+    // 上传后回读校验：确认远端文件确实落地且大小一致，
+    // 否则“备份完成”的提示会掩盖上传失败。
+    let verified = null;
+    try {
+      verified = await client.stat(path);
+    } catch (error) {
+      throw new Error(
+        '上传后无法读取远端文件属性：' +
+          (error && error.message ? error.message : String(error))
+      );
+    }
+    if (Number(verified.size) !== bytes.byteLength) {
+      throw new Error(
+        '上传校验失败：远端 ' +
+          verified.size +
+          ' 字节，本地 ' +
+          bytes.byteLength +
+          ' 字节'
+      );
+    }
+
     await this.pruneRemoteBackups(client, folder);
-    return path;
+    return { path, size: bytes.byteLength, etag: verified.etag };
   }
 
   async pruneRemoteBackups(client, folder) {
@@ -2540,11 +2730,14 @@ class WebDAVrSyncPlugin extends Plugin {
         'application/octet-stream'
       );
 
-      let remotePath = null;
+      let remotePath = '';
+      let remoteSize = 0;
       let remoteError = '';
       if (String(this.settings.serverUrl || '').trim()) {
         try {
-          remotePath = await this.uploadEncryptedBackup(filename, text);
+          const uploaded = await this.uploadEncryptedBackup(filename, text);
+          remotePath = uploaded.path;
+          remoteSize = uploaded.size;
         } catch (error) {
           remoteError = error && error.message ? error.message : String(error);
         }
@@ -2568,12 +2761,20 @@ class WebDAVrSyncPlugin extends Plugin {
       if (!String(this.settings.serverUrl || '').trim()) {
         message += '；未配置 WebDAV，仅保存到本机';
       }
-      if (remotePath) message += '；已上传到 ' + safeDecodeUri(remotePath);
+      if (remotePath) {
+        message +=
+          '；已上传到 ' +
+          safeDecodeUri(remotePath) +
+          '（' +
+          formatBytes(remoteSize) +
+          '，已校验）';
+      }
       if (remoteError) message += '；上传 WebDAV 失败：' + remoteError;
       if (bundle.warnings.length) {
         message += '；' + bundle.warnings.length + ' 条警告，详见 Console';
       }
       new Notice(message, 15000);
+      this.lastBackup = { at: Date.now(), filename, message };
       if (bundle.warnings.length) {
         console.warn('[WebDAVrSync] 备份警告', bundle.warnings);
       }
@@ -2589,6 +2790,7 @@ class WebDAVrSyncPlugin extends Plugin {
       const message = error && error.message ? error.message : String(error);
       new Notice('WebDAVrSync 备份失败：' + message, 12000);
       console.error('[WebDAVrSync] 备份失败', error);
+      this.lastBackup = { at: Date.now(), filename: '', message: '失败：' + message };
       return { ok: false, error: message };
     }
   }
@@ -3210,6 +3412,33 @@ class WebDAVrSyncSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName('同步回收站（.trash）')
+      .setDesc(
+        '开启：删除的文件移入 Obsidian 回收站后也会备份到 WebDAV，' +
+          '远端删除本地文件时内容不会彻底丢失。关闭：回收站内容不参与同步。' +
+          '本项优先于忽略规则里的 .trash 写法。'
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(!!plugin.settings.syncTrash).onChange(async (value) => {
+          plugin.settings.syncTrash = value;
+          await plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('同步空目录')
+      .setDesc(
+        '开启：本地没有文件的目录也会在 WebDAV 上建立同名目录，' +
+          '浏览器里看到的目录结构与本地仓库一致。'
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(!!plugin.settings.syncEmptyDirs).onChange(async (value) => {
+          plugin.settings.syncEmptyDirs = value;
+          await plugin.saveSettings();
+        })
+      );
+
     new Setting(containerEl).setName('忽略规则').setHeading();
 
     new Setting(containerEl)
@@ -3317,12 +3546,23 @@ class WebDAVrSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    if (plugin.lastBackup) {
+      new Setting(containerEl)
+        .setName('最近一次备份')
+        .setDesc(
+          new Date(plugin.lastBackup.at).toLocaleString() +
+            '：' +
+            plugin.lastBackup.message
+        );
+    }
+
     new Setting(containerEl)
       .setName('立即创建加密备份')
       .setDesc(
         '读取所有插件的配置文件、Copilot 在 Obsidian Keychain 中的 API Key，' +
           '以及其他插件 data.json 里的明文 token/key。' +
-          '备份使用 AES-256-GCM 加密，密码不会保存；忘记密码将无法恢复。'
+          '备份使用 AES-256-GCM 加密，密码不会保存；忘记密码将无法恢复。' +
+          '上传后会自动回读校验，确认远端文件已落地。'
       )
       .addButton((button) =>
         button
