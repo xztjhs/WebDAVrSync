@@ -1,4 +1,4 @@
-# WebDAVrSync installer for Obsidian (Windows PowerShell 5.1+)
+﻿# WebDAVrSync installer for Obsidian (Windows PowerShell 5.1+)
 #
 # Usage:
 #   .\install.ps1 -VaultPath "D:\MyVault"
@@ -34,7 +34,17 @@ $dest = Join-Path $obsidianDir 'plugins\webdavrsync'
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 $inPlace = (Resolve-Path -LiteralPath $source).Path -eq (Resolve-Path -LiteralPath $dest).Path
 
-$files = @('main.js', 'manifest.json', 'versions.json', 'README.md', 'LICENSE', '.gitignore')
+$files = @(
+    'main.js',
+    'manifest.json',
+    'versions.json',
+    'README.md',
+    '使用手册.md',
+    'CHANGELOG.md',
+    'LICENSE',
+    'install.ps1',
+    '.gitignore'
+)
 foreach ($file in $files) {
     $from = Join-Path $source $file
     if (-not (Test-Path -LiteralPath $from)) {

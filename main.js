@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * WebDAVrSync 1.0.0
+ * WebDAVrSync 1.1.0
  * A small, dependency-free, open-source Obsidian plugin that synchronizes a
  * vault with any WebDAV server that supports PROPFIND / PUT / GET / MKCOL /
  * DELETE (for example SFTPGo, Nextcloud, ownCloud, Apache mod_dav, nginx-dav).
@@ -23,7 +23,10 @@ const {
 } = require('obsidian');
 
 const PLUGIN_ID = 'webdavrsync';
+const PLUGIN_VERSION_FALLBACK = '1.1.0';
 const STATE_VERSION = 1;
+const CONFIG_FORMAT = 'webdavrsync-config';
+const CONFIG_FORMAT_VERSION = 1;
 
 const DEFAULT_IGNORE_TEXT = [
   '# 每行一个 glob：* 匹配同一层，** 匹配任意层，? 匹配单个字符',
@@ -267,6 +270,95 @@ function compileIgnore(settings) {
     const p = normalizeRelPath(path);
     if (!p) return false;
     return regexes.some((re) => re.test(p));
+  };
+}
+
+function toBoolean(value, fallback) {
+  if (typeof value === 'boolean') return value;
+  if (value === 1 || value === '1' || value === 'true') return true;
+  if (value === 0 || value === '0' || value === 'false') return false;
+  return fallback;
+}
+
+function normalizeSettings(input) {
+  const source = input && typeof input === 'object' ? input : {};
+  const merged = Object.assign({}, DEFAULT_SETTINGS, source);
+  return {
+    serverUrl: String(merged.serverUrl || '').trim(),
+    username: String(merged.username || ''),
+    password: String(merged.password || ''),
+    remoteRoot: String(merged.remoteRoot || '/').trim() || '/',
+    deviceName: String(merged.deviceName || 'PC').trim() || 'PC',
+    syncIntervalMinutes: Math.max(
+      0,
+      Math.min(1440, Number(merged.syncIntervalMinutes) || 0)
+    ),
+    syncOnStart: toBoolean(merged.syncOnStart, DEFAULT_SETTINGS.syncOnStart),
+    syncOnChange: toBoolean(merged.syncOnChange, DEFAULT_SETTINGS.syncOnChange),
+    allowDeletions: toBoolean(merged.allowDeletions, DEFAULT_SETTINGS.allowDeletions),
+    conflictStrategy: merged.conflictStrategy === 'newest' ? 'newest' : 'keep-both',
+    syncConfig: toBoolean(merged.syncConfig, DEFAULT_SETTINGS.syncConfig),
+    verifyContent: toBoolean(merged.verifyContent, DEFAULT_SETTINGS.verifyContent),
+    ignoreText:
+      typeof merged.ignoreText === 'string' ? merged.ignoreText : DEFAULT_SETTINGS.ignoreText,
+  };
+}
+
+function parseConfigImport(text, currentSettings) {
+  let raw;
+  try {
+    raw = JSON.parse(String(text || ''));
+  } catch (error) {
+    throw new Error('不是有效的 JSON 文件');
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('配置内容格式不正确');
+  }
+  if (raw.format && raw.format !== CONFIG_FORMAT) {
+    throw new Error('不是 WebDAVrSync 配置文件（format=' + raw.format + '）');
+  }
+  if (
+    raw.formatVersion !== undefined &&
+    Number.isFinite(Number(raw.formatVersion)) &&
+    Number(raw.formatVersion) > CONFIG_FORMAT_VERSION
+  ) {
+    throw new Error(
+      '配置格式版本过新（' +
+        raw.formatVersion +
+        '），请升级 WebDAVrSync 后再导入'
+    );
+  }
+
+  const rawSettings =
+    raw.settings && typeof raw.settings === 'object' ? raw.settings : raw;
+  if (!rawSettings || typeof rawSettings !== 'object' || Array.isArray(rawSettings)) {
+    throw new Error('配置中缺少 settings');
+  }
+
+  const hasPasswordField = Object.prototype.hasOwnProperty.call(rawSettings, 'password');
+  let passwordIncluded;
+  if (raw.passwordIncluded === false) passwordIncluded = false;
+  else if (raw.passwordIncluded === true) passwordIncluded = true;
+  else passwordIncluded = hasPasswordField;
+
+  const base =
+    currentSettings && typeof currentSettings === 'object'
+      ? currentSettings
+      : DEFAULT_SETTINGS;
+  const merged = Object.assign({}, base, rawSettings);
+  if (!passwordIncluded) merged.password = base.password || '';
+
+  const settings = normalizeSettings(merged);
+  if (!settings.serverUrl) {
+    throw new Error('配置中没有 WebDAV 地址');
+  }
+
+  return {
+    settings,
+    passwordIncluded,
+    pluginVersion: String(raw.pluginVersion || ''),
+    exportedAt: String(raw.exportedAt || ''),
+    format: String(raw.format || ''),
   };
 }
 
@@ -1199,7 +1291,7 @@ class SyncEngine {
 class WebDAVrSyncPlugin extends Plugin {
   async onload() {
     const data = (await this.loadData()) || {};
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
+    this.settings = normalizeSettings(data.settings || {});
     this.ignoreFn = compileIgnore(this.settings);
     this.syncState = this.normalizeState(data.state);
     this.syncing = false;
@@ -1460,6 +1552,192 @@ class WebDAVrSyncPlugin extends Plugin {
     }
   }
 
+  buildConfigExport(includePassword) {
+    const settings = Object.assign({}, this.settings);
+    settings.password = includePassword ? String(this.settings.password || '') : '';
+    return {
+      format: CONFIG_FORMAT,
+      formatVersion: CONFIG_FORMAT_VERSION,
+      pluginVersion:
+        this.manifest && this.manifest.version
+          ? this.manifest.version
+          : PLUGIN_VERSION_FALLBACK,
+      exportedAt: new Date().toISOString(),
+      passwordIncluded: !!includePassword,
+      settings,
+    };
+  }
+
+  async exportConfigFile(includePassword) {
+    try {
+      const payload = this.buildConfigExport(includePassword);
+      const text = JSON.stringify(payload, null, 2);
+      const filename =
+        'webdavrsync-config-' +
+        timestampForName(new Date()) +
+        (includePassword ? '-with-password' : '') +
+        '.json';
+
+      if (
+        typeof document !== 'undefined' &&
+        typeof Blob !== 'undefined' &&
+        typeof URL !== 'undefined' &&
+        typeof URL.createObjectURL === 'function'
+      ) {
+        const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        anchor.style.display = 'none';
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => {
+          try {
+            URL.revokeObjectURL(url);
+          } catch (error) {
+            // Ignore cleanup failure.
+          }
+        }, 10000);
+        new Notice(
+          'WebDAVrSync：配置已导出为 ' + filename +
+            (includePassword ? '（含明文密码，请妥善保管）' : ''),
+          7000
+        );
+        return payload;
+      }
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        new Notice('WebDAVrSync：当前环境不能直接下载文件，配置已复制到剪贴板', 7000);
+        return payload;
+      }
+
+      throw new Error('当前环境不支持文件下载或剪贴板');
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      new Notice('WebDAVrSync：导出配置失败 - ' + message, 10000);
+      console.error('[WebDAVrSync] 导出配置失败', error);
+      return null;
+    }
+  }
+
+  pickConfigFile(onDone) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+
+    input.addEventListener('cancel', () => input.remove());
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      input.remove();
+      if (!file) return;
+      try {
+        if (file.size > 2 * 1024 * 1024) {
+          throw new Error('配置文件大于 2MB，可能不是配置 JSON');
+        }
+        const text = await file.text();
+        const result = await this.importConfigFromText(text);
+        if (onDone) onDone(result);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        new Notice('WebDAVrSync：导入配置失败 - ' + message, 10000);
+        console.error('[WebDAVrSync] 导入配置失败', error);
+        if (onDone) onDone({ ok: false, error: message });
+      }
+    });
+
+    input.click();
+  }
+
+  async importConfigFromText(text) {
+    const imported = parseConfigImport(text, this.settings);
+    return await this.applyConfigImport(imported);
+  }
+
+  async applyConfigImport(imported, options) {
+    const opts = options || {};
+    if (this.syncing) {
+      throw new Error('同步正在进行，请等待同步完成后再导入配置');
+    }
+    if (!imported || !imported.settings) {
+      throw new Error('配置内容为空');
+    }
+
+    const nextSettings = normalizeSettings(imported.settings);
+    if (!nextSettings.serverUrl) {
+      throw new Error('配置中没有 WebDAV 地址');
+    }
+    if (!imported.passwordIncluded) {
+      nextSettings.password = this.settings.password || '';
+    }
+
+    const oldTarget = String(this.settings.serverUrl || '').trim().replace(/\/+$/, '');
+    const newTarget = String(nextSettings.serverUrl || '').trim().replace(/\/+$/, '');
+    const oldRoot = normalizeRemoteRoot(this.settings.remoteRoot);
+    const newRoot = normalizeRemoteRoot(nextSettings.remoteRoot);
+    const targetChanged = oldTarget !== newTarget || oldRoot !== newRoot;
+
+    if (!opts.skipConfirm) {
+      const lines = [
+        '即将导入 WebDAVrSync 配置：',
+        '',
+        '服务器：' + nextSettings.serverUrl,
+        '远程根目录：' + (nextSettings.remoteRoot || '/'),
+        '用户名：' + (nextSettings.username || '(未填写)'),
+        '密码：' +
+          (imported.passwordIncluded
+            ? '包含在文件中'
+            : this.settings.password
+              ? '文件未包含，将保留当前密码'
+              : '文件未包含，需要手动填写'),
+        '',
+        targetChanged
+          ? '服务器或远程根目录已变化，导入后会清空文件对照表（不会删除文件）。'
+          : '服务器和远程根目录未变化，会保留现有文件对照表。',
+        '导入后不会自动同步，请先测试连接。',
+        '',
+        '是否继续？',
+      ];
+      if (!window.confirm(lines.join('\n'))) {
+        return { ok: false, canceled: true };
+      }
+    }
+
+    this.settings = nextSettings;
+    if (this.recentWrites) this.recentWrites.clear();
+    if (targetChanged) {
+      this.syncState = {
+        version: STATE_VERSION,
+        lastSync: 0,
+        files: Object.create(null),
+      };
+    }
+    this.ignoreFn = compileIgnore(this.settings);
+    await this.saveAll();
+    this.configureInterval();
+    this.refreshStatus();
+
+    let message = 'WebDAVrSync：配置已导入';
+    if (targetChanged) message += '，文件对照表已清空';
+    if (!imported.passwordIncluded) {
+      message += this.settings.password
+        ? '；文件不含密码，已保留当前密码'
+        : '；文件不含密码，请手动填写密码';
+    }
+    message += '。请先测试连接。';
+    new Notice(message, 8000);
+
+    return {
+      ok: true,
+      targetChanged,
+      passwordIncluded: !!imported.passwordIncluded,
+    };
+  }
+
   async resetSyncState() {
     const confirmed = window.confirm(
       '确定清空同步状态吗？\n\n不会删除任何文件，但下次同步会把两端所有文件重新比较一遍，文件多时可能较慢。'
@@ -1667,6 +1945,43 @@ class WebDAVrSyncSettingTab extends PluginSettingTab {
         text.inputEl.style.fontFamily = 'monospace';
       });
 
+    new Setting(containerEl).setName('配置导出 / 导入').setHeading();
+
+    new Setting(containerEl)
+      .setName('导出配置（含密码）')
+      .setDesc('生成 JSON 文件，包含地址、账号、密码和全部同步设置；可直接在另一台机器导入。请勿公开分享。')
+      .addButton((button) =>
+        button
+          .setButtonText('导出')
+          .setWarning()
+          .onClick(async () => {
+            await plugin.exportConfigFile(true);
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('导出配置（不含密码）')
+      .setDesc('适合备份或分享；导入到已有配置时不会覆盖当前密码。')
+      .addButton((button) =>
+        button.setButtonText('导出').onClick(async () => {
+          await plugin.exportConfigFile(false);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('导入配置')
+      .setDesc(
+        '选择 WebDAVrSync 导出的 JSON（也可以直接选本插件目录下的 data.json）。' +
+          '不会导入文件对照表；服务器或远程根目录变化时会自动清空对照表。'
+      )
+      .addButton((button) =>
+        button.setButtonText('选择 JSON 文件').onClick(() => {
+          plugin.pickConfigFile((result) => {
+            if (result && result.ok) this.display();
+          });
+        })
+      );
+
     new Setting(containerEl).setName('操作').setHeading();
 
     new Setting(containerEl)
@@ -1717,5 +2032,9 @@ module.exports.SyncEngine = SyncEngine;
 module.exports.WebDAVrSyncSettingTab = WebDAVrSyncSettingTab;
 module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.DEFAULT_IGNORE_TEXT = DEFAULT_IGNORE_TEXT;
+module.exports.CONFIG_FORMAT = CONFIG_FORMAT;
+module.exports.CONFIG_FORMAT_VERSION = CONFIG_FORMAT_VERSION;
+module.exports.normalizeSettings = normalizeSettings;
+module.exports.parseConfigImport = parseConfigImport;
 module.exports.compileIgnore = compileIgnore;
 module.exports.formatSummary = formatSummary;

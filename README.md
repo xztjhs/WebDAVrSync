@@ -21,6 +21,8 @@
 - 首次同步或双方同时修改时，可逐字节校验同尺寸文件，减少误报冲突。
 - 中文、空格、特殊字符路径按 URL 编码处理。
 - 状态栏显示同步进度，点击状态栏可立即同步。
+- 配置导出 / 导入：可导出含密码或不含密码的 JSON，在另一台机器快速恢复设置。
+- 详细图文步骤见 [使用手册.md](使用手册.md)。
 
 ## 安装
 
@@ -82,6 +84,24 @@
 | 同步 .obsidian 配置 | 默认关闭；本插件目录始终排除 |
 | 内容校验 | 同尺寸文件逐字节比较，较慢但更安全 |
 | 忽略规则 | 每行一个 glob：`*` 匹配一层，`**` 匹配任意层，`#` 注释 |
+
+## 配置导出 / 导入
+
+在插件设置最下方：
+
+- **导出配置（含密码）**：生成 `webdavrsync-config-YYYYMMDD-HHMMSS-with-password.json`，
+  包含地址、账号、密码和全部同步设置，可直接在另一台机器导入。文件含明文密码，
+  请勿公开分享。
+- **导出配置（不含密码）**：适合备份或分享；导入到已有配置时保留当前密码。
+- **导入配置**：选择导出的 JSON，也可以直接选择本插件目录下的 `data.json`。
+
+导入时会弹窗显示目标服务器、远程根目录和密码处理方式，确认后才会应用。导入不会
+自动同步，也不会导入“文件对照表”：
+
+- 服务器或远程根目录发生变化 → 清空文件对照表，下次同步重新比较两端文件；
+- 服务器和根目录未变化 → 保留现有文件对照表，只更新设置。
+
+导入后请先点“测试连接”，确认无误再点“立即同步”。
 
 ## 同步逻辑
 
@@ -156,7 +176,14 @@ bun test tests/sync.test.js
 ```
 
 测试会启动一个内存 WebDAV 服务器和一个模拟的 Obsidian `DataAdapter`，
-覆盖上传、下载、冲突、删除、忽略规则、中文路径等场景。
+覆盖上传、下载、冲突、删除、忽略规则、中文路径、配置导出导入等场景。
+
+## 版本历史
+
+- **1.1.0**（2026-10-26）：新增配置导出 / 导入；连接失败提示更明确；补充使用手册。
+- **1.0.0**（2026-10-25）：首个版本，双向同步、冲突副本、定时/自动同步、忽略规则。
+
+完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 
@@ -169,7 +196,7 @@ MIT，见 [LICENSE](LICENSE)。
 WebDAVrSync is a small, dependency-free, MIT-licensed Obsidian plugin that
 synchronizes a vault with any standard WebDAV server. It supports manual,
 interval, startup and change-triggered syncs, two-way deletion propagation,
-conflict copies, ignore globs, and optional `.obsidian` config sync. The plugin
-folder itself is always excluded because `data.json` contains the WebDAV
-password. No build step is required: copy the folder into
-`<vault>/.obsidian/plugins/webdavrsync/` and enable it.
+conflict copies, ignore globs, optional `.obsidian` config sync, and JSON
+config export/import. The plugin folder itself is always excluded because
+`data.json` contains the WebDAV password. No build step is required: copy the
+folder into `<vault>/.obsidian/plugins/webdavrsync/` and enable it.
