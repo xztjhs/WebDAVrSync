@@ -256,7 +256,7 @@ bun test tests/sync.test.js
 - Gitea 仓库：<http://192.168.254.253:60006/admin/WebDAVrSync>
 - Releases 页面提供每个版本的插件包（`.zip`）与说明：
   <http://192.168.254.253:60006/admin/WebDAVrSync/releases>
-- 版本标签：`v1.0.0`、`v1.1.0`、`v1.2.0`
+- 版本标签：`v1.0.0`、`v1.1.0`、`v1.2.0`、`v1.2.1`
 
 安装（其他机器）：
 
