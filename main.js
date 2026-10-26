@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * WebDAVrSync 1.1.0
+ * WebDAVrSync 1.2.0
  * A small, dependency-free, open-source Obsidian plugin that synchronizes a
  * vault with any WebDAV server that supports PROPFIND / PUT / GET / MKCOL /
  * DELETE (for example SFTPGo, Nextcloud, ownCloud, Apache mod_dav, nginx-dav).
@@ -19,14 +19,41 @@ const {
   Setting,
   Notice,
   TFile,
+  Modal,
   requestUrl,
 } = require('obsidian');
 
 const PLUGIN_ID = 'webdavrsync';
-const PLUGIN_VERSION_FALLBACK = '1.1.0';
+const PLUGIN_VERSION_FALLBACK = '1.2.0';
 const STATE_VERSION = 1;
 const CONFIG_FORMAT = 'webdavrsync-config';
 const CONFIG_FORMAT_VERSION = 1;
+const BACKUP_FORMAT = 'webdavrsync-plugin-backup';
+const BACKUP_FILE_FORMAT = 'webdavrsync-encrypted-backup';
+const BACKUP_FORMAT_VERSION = 1;
+const BACKUP_KDF_ITERATIONS = 210000;
+const BACKUP_MAX_FILE_SIZE = 25 * 1024 * 1024;
+const BACKUP_MAX_TOTAL_SIZE = 100 * 1024 * 1024;
+const BACKUP_TEXT_EXTENSIONS = [
+  '.json',
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.css',
+  '.md',
+  '.txt',
+  '.html',
+  '.htm',
+  '.xml',
+  '.yaml',
+  '.yml',
+  '.toml',
+  '.ini',
+  '.conf',
+  '.env',
+  '.csv',
+  '.svg',
+];
 
 const DEFAULT_IGNORE_TEXT = [
   '# 每行一个 glob：* 匹配同一层，** 匹配任意层，? 匹配单个字符',
@@ -34,6 +61,8 @@ const DEFAULT_IGNORE_TEXT = [
   '.obsidian/workspace.json',
   '.obsidian/workspace-mobile.json',
   '.obsidian/plugins/webdavrsync/**',
+  '.webdavrsync-backups/**',
+  '**/*.pre-restore-*.bak',
   '.trash/**',
   '**/.git/**',
   '**/node_modules/**',
@@ -57,6 +86,9 @@ const DEFAULT_SETTINGS = {
   syncConfig: false,
   verifyContent: true,
   ignoreText: DEFAULT_IGNORE_TEXT,
+  backupFolder: '.webdavrsync-backups',
+  backupKeep: 10,
+  backupIncludePluginCode: false,
 };
 
 const MULTISTATUS_BODY = [
@@ -261,10 +293,22 @@ function compileIgnore(settings) {
     add('.obsidian/**');
   }
 
+  // The encrypted backup folder is managed by the backup feature, not by the
+  // normal file sync. It lives on the remote and must not be pulled locally.
+  const backupFolder = normalizeRelPath(settings.backupFolder || '');
+  if (backupFolder) {
+    add(backupFolder);
+    add(backupFolder + '/**');
+  }
+
   // Never sync this plugin's own folder: data.json contains the WebDAV
   // password and would otherwise be uploaded to the server.
   add('.obsidian/plugins/' + PLUGIN_ID);
   add('.obsidian/plugins/' + PLUGIN_ID + '/**');
+
+  // Plain-text copies made before a restore may contain plugin tokens/keys.
+  // Never upload them to the WebDAV server.
+  add('**/*.pre-restore-*.bak');
 
   return (path) => {
     const p = normalizeRelPath(path);
@@ -301,6 +345,20 @@ function normalizeSettings(input) {
     verifyContent: toBoolean(merged.verifyContent, DEFAULT_SETTINGS.verifyContent),
     ignoreText:
       typeof merged.ignoreText === 'string' ? merged.ignoreText : DEFAULT_SETTINGS.ignoreText,
+    backupFolder:
+      normalizeRelPath(merged.backupFolder || DEFAULT_SETTINGS.backupFolder) ||
+      DEFAULT_SETTINGS.backupFolder,
+    backupKeep: Math.max(
+      1,
+      Math.min(
+        100,
+        Math.floor(Number(merged.backupKeep) || DEFAULT_SETTINGS.backupKeep)
+      )
+    ),
+    backupIncludePluginCode: toBoolean(
+      merged.backupIncludePluginCode,
+      DEFAULT_SETTINGS.backupIncludePluginCode
+    ),
   };
 }
 
@@ -360,6 +418,311 @@ function parseConfigImport(text, currentSettings) {
     exportedAt: String(raw.exportedAt || ''),
     format: String(raw.format || ''),
   };
+}
+
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) return value;
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return new Uint8Array(value);
+}
+
+function arrayBufferToBase64(value) {
+  const bytes = toUint8Array(value);
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(bytes).toString('base64');
+  }
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(value) {
+  const text = String(value || '');
+  if (typeof Buffer !== 'undefined') {
+    const buffer = Buffer.from(text, 'base64');
+    return buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength
+    );
+  }
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function isBackupTextFile(path) {
+  const lower = String(path || '').toLowerCase();
+  return BACKUP_TEXT_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return value + ' B';
+  if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+  return (value / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function downloadTextFile(filename, text, mimeType) {
+  try {
+    if (
+      typeof document === 'undefined' ||
+      typeof Blob === 'undefined' ||
+      typeof URL === 'undefined' ||
+      typeof URL.createObjectURL !== 'function'
+    ) {
+      return false;
+    }
+    const blob = new Blob([text], { type: mimeType || 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        // Ignore cleanup failure.
+      }
+    }, 10000);
+    return true;
+  } catch (error) {
+    console.error('[WebDAVrSync] 下载文件失败', error);
+    return false;
+  }
+}
+
+function readFileText(file) {
+  if (file && typeof file.text === 'function') {
+    return file.text();
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+    reader.readAsText(file);
+  });
+}
+
+async function ensureAdapterDir(adapter, path) {
+  const dir = normalizeRelPath(path);
+  if (!dir) return;
+  const parts = dir.split('/');
+  let current = '';
+  for (const segment of parts) {
+    current = current ? current + '/' + segment : segment;
+    if (!(await adapter.exists(current))) {
+      try {
+        await adapter.mkdir(current);
+      } catch (error) {
+        if (!(await adapter.exists(current))) throw error;
+      }
+    }
+  }
+}
+
+async function readAdapterText(adapter, path) {
+  try {
+    const data = await adapter.readBinary(path);
+    return new TextDecoder().decode(data);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function readAdapterBinary(adapter, path) {
+  try {
+    return await adapter.readBinary(path);
+  } catch (error) {
+    return null;
+  }
+}
+
+const SECRET_FIELD_PATTERN =
+  /(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|passwd|password|credential|license[_-]?key|webhook)/i;
+
+function scanSecretFields(value, pluginId, prefix, out, depth) {
+  if (!out || out.length >= 500 || depth > 10) return;
+  if (Array.isArray(value)) {
+    const count = Math.min(value.length, 200);
+    for (let i = 0; i < count; i++) {
+      scanSecretFields(value[i], pluginId, prefix + '[' + i + ']', out, depth + 1);
+    }
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const key of Object.keys(value)) {
+      const path = prefix ? prefix + '.' + key : key;
+      scanSecretFields(value[key], pluginId, path, out, depth + 1);
+    }
+    return;
+  }
+  if (typeof value === 'string' && value.length > 0 && SECRET_FIELD_PATTERN.test(prefix)) {
+    out.push({
+      plugin: pluginId,
+      path: prefix,
+      kind: /keychain/i.test(prefix) ? 'keychain-ref' : 'plaintext',
+      length: value.length,
+    });
+  }
+}
+
+const LEGACY_COPILOT_SECRET_FIELDS = [
+  'openAIApiKey',
+  'openAIOrgId',
+  'huggingfaceApiKey',
+  'cohereApiKey',
+  'anthropicApiKey',
+  'googleApiKey',
+  'openRouterAiApiKey',
+  'xaiApiKey',
+  'mistralApiKey',
+  'deepseekApiKey',
+  'siliconflowApiKey',
+  'groqApiKey',
+  'firecrawlApiKey',
+  'perplexityApiKey',
+  'parallelApiKey',
+  'exaApiKey',
+  'supadataApiKey',
+  'plusLicenseKey',
+  'entitlementToken',
+];
+
+function legacyCopilotSecretId(vaultId, field) {
+  if (!vaultId) return null;
+  const normalized = String(field)
+    .replace(/([A-Z])/g, '-$1')
+    .toLowerCase()
+    .replace(/^-/, '');
+  const id = 'copilot-v' + vaultId + '-' + normalized;
+  return id.length <= 64 ? id : null;
+}
+
+function getWebCrypto() {
+  const webCrypto =
+    typeof globalThis !== 'undefined' && globalThis.crypto
+      ? globalThis.crypto
+      : null;
+  if (!webCrypto || !webCrypto.subtle) {
+    throw new Error('当前环境不支持 WebCrypto，无法加密备份');
+  }
+  return webCrypto;
+}
+
+async function deriveBackupKey(password, salt, iterations) {
+  const webCrypto = getWebCrypto();
+  const material = await webCrypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(String(password || '')),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  return await webCrypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt,
+      iterations,
+      hash: 'SHA-256',
+    },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encryptBackupBundle(bundle, password, options) {
+  const passphrase = String(password || '');
+  if (passphrase.trim().length < 8) {
+    throw new Error('备份密码至少 8 个字符');
+  }
+  const opts = options || {};
+  const iterations = Number(opts.iterations) || BACKUP_KDF_ITERATIONS;
+  const webCrypto = getWebCrypto();
+  const salt = webCrypto.getRandomValues(new Uint8Array(16));
+  const iv = webCrypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveBackupKey(passphrase, salt, iterations);
+  const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
+  const ciphertext = await webCrypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    plaintext
+  );
+  return {
+    format: BACKUP_FILE_FORMAT,
+    formatVersion: BACKUP_FORMAT_VERSION,
+    pluginVersion: bundle.pluginVersion || PLUGIN_VERSION_FALLBACK,
+    createdAt: new Date().toISOString(),
+    cipher: 'AES-256-GCM',
+    kdf: 'PBKDF2-SHA256',
+    iterations,
+    salt: arrayBufferToBase64(salt),
+    iv: arrayBufferToBase64(iv),
+    ciphertext: arrayBufferToBase64(ciphertext),
+  };
+}
+
+async function decryptBackupBundle(envelope, password) {
+  if (!envelope || envelope.format !== BACKUP_FILE_FORMAT) {
+    throw new Error('不是 WebDAVrSync 加密备份文件');
+  }
+  if (
+    envelope.formatVersion !== undefined &&
+    Number(envelope.formatVersion) > BACKUP_FORMAT_VERSION
+  ) {
+    throw new Error('备份文件版本过新，请升级 WebDAVrSync');
+  }
+  const iterations = Number(envelope.iterations);
+  if (!Number.isFinite(iterations) || iterations < 10000 || iterations > 2000000) {
+    throw new Error('备份文件的密钥派生参数异常');
+  }
+  if (!envelope.salt || !envelope.iv || !envelope.ciphertext) {
+    throw new Error('备份文件缺少加密参数');
+  }
+
+  const webCrypto = getWebCrypto();
+  const salt = new Uint8Array(base64ToArrayBuffer(envelope.salt));
+  const iv = new Uint8Array(base64ToArrayBuffer(envelope.iv));
+  const ciphertext = base64ToArrayBuffer(envelope.ciphertext);
+  const key = await deriveBackupKey(String(password || ''), salt, iterations);
+  let plaintext;
+  try {
+    plaintext = await webCrypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      ciphertext
+    );
+  } catch (error) {
+    throw new Error('密码错误或备份文件已损坏');
+  }
+
+  let bundle;
+  try {
+    bundle = JSON.parse(new TextDecoder().decode(plaintext));
+  } catch (error) {
+    throw new Error('备份内容不是有效 JSON');
+  }
+  if (!bundle || bundle.format !== BACKUP_FORMAT) {
+    throw new Error('备份内容格式不正确');
+  }
+  if (
+    bundle.formatVersion !== undefined &&
+    Number(bundle.formatVersion) > BACKUP_FORMAT_VERSION
+  ) {
+    throw new Error('备份内容版本过新，请升级插件');
+  }
+  return bundle;
 }
 
 function formatSummary(summary) {
@@ -654,14 +1017,20 @@ class WebDAVClient {
     }
   }
 
-  async ensureParents(path) {
-    const parts = normalizeRelPath(path).split('/');
-    parts.pop();
+  async ensureDir(dir) {
+    const normalized = normalizeRelPath(dir);
+    if (!normalized) return;
     let current = '';
-    for (const segment of parts) {
+    for (const segment of normalized.split('/')) {
       current = current ? current + '/' + segment : segment;
       if (!this.dirCache.has(current)) await this.mkcol(current);
     }
+  }
+
+  async ensureParents(path) {
+    const parts = normalizeRelPath(path).split('/');
+    parts.pop();
+    await this.ensureDir(parts.join('/'));
   }
 
   async put(path, data) {
@@ -1639,7 +2008,7 @@ class WebDAVrSyncPlugin extends Plugin {
         if (file.size > 2 * 1024 * 1024) {
           throw new Error('配置文件大于 2MB，可能不是配置 JSON');
         }
-        const text = await file.text();
+        const text = await readFileText(file);
         const result = await this.importConfigFromText(text);
         if (onDone) onDone(result);
       } catch (error) {
@@ -1738,6 +2107,753 @@ class WebDAVrSyncPlugin extends Plugin {
     };
   }
 
+  backupFileName() {
+    return (
+      'webdavrsync-plugin-backup-' +
+      timestampForName(new Date()) +
+      '-' +
+      randomSuffix() +
+      '.wdrsbackup'
+    );
+  }
+
+  async listAdapterFiles(adapter, dir, warnings) {
+    const files = [];
+    let listing;
+    try {
+      listing = await adapter.list(dir);
+    } catch (error) {
+      if (warnings) warnings.push('无法读取目录 ' + dir + '：' + (error.message || error));
+      return files;
+    }
+    for (const file of listing.files || []) files.push(file);
+    for (const folder of listing.folders || []) {
+      const normalized = normalizeRelPath(folder);
+      if (normalized.includes('/node_modules') || normalized.includes('/.git/')) continue;
+      files.push(...(await this.listAdapterFiles(adapter, folder, warnings)));
+    }
+    return files;
+  }
+
+  async collectAllPluginFiles(adapter, folder, entry, state, warnings) {
+    const files = await this.listAdapterFiles(adapter, folder, warnings);
+    for (const file of files) {
+      const rel = normalizeRelPath(file.slice(folder.length + 1));
+      if (!rel || rel === 'data.json' || rel === 'manifest.json') continue;
+      if (rel.includes('.pre-restore-')) continue;
+      if (state.totalBytes >= BACKUP_MAX_TOTAL_SIZE) {
+        warnings.push('备份达到 100MB 上限，已跳过：' + file);
+        break;
+      }
+      let stat;
+      try {
+        stat = await adapter.stat(file);
+      } catch (error) {
+        warnings.push('无法读取文件信息：' + file);
+        continue;
+      }
+      if (!stat || stat.type === 'folder') continue;
+      if (Number(stat.size) > BACKUP_MAX_FILE_SIZE) {
+        warnings.push('文件超过 25MB，已跳过：' + file);
+        continue;
+      }
+      const data = await readAdapterBinary(adapter, file);
+      if (data === null) {
+        warnings.push('无法读取文件：' + file);
+        continue;
+      }
+      const bytes = toUint8Array(data);
+      state.totalBytes += bytes.byteLength;
+      state.fileCount++;
+      if (isBackupTextFile(rel)) {
+        entry.files[rel] = {
+          encoding: 'utf8',
+          data: new TextDecoder().decode(bytes),
+        };
+      } else {
+        entry.files[rel] = {
+          encoding: 'base64',
+          data: arrayBufferToBase64(bytes),
+        };
+      }
+    }
+  }
+
+  async collectPluginConfigFiles(adapter, folder, entry, state, warnings) {
+    const files = await this.listAdapterFiles(adapter, folder, warnings);
+    const extensions = [
+      '.json',
+      '.yaml',
+      '.yml',
+      '.toml',
+      '.ini',
+      '.conf',
+      '.env',
+      '.txt',
+    ];
+    for (const file of files) {
+      const rel = normalizeRelPath(file.slice(folder.length + 1));
+      if (!rel || rel === 'data.json' || rel === 'manifest.json') continue;
+      const lower = rel.toLowerCase();
+      if (!extensions.some((extension) => lower.endsWith(extension))) continue;
+      if (state.totalBytes >= BACKUP_MAX_TOTAL_SIZE) {
+        warnings.push('备份达到 100MB 上限，已跳过：' + file);
+        break;
+      }
+      let stat;
+      try {
+        stat = await adapter.stat(file);
+      } catch (error) {
+        warnings.push('无法读取文件信息：' + file);
+        continue;
+      }
+      if (!stat || stat.type === 'folder' || Number(stat.size) > 2 * 1024 * 1024) {
+        continue;
+      }
+      const text = await readAdapterText(adapter, file);
+      if (text === null) {
+        warnings.push('无法读取配置文件：' + file);
+        continue;
+      }
+      state.totalBytes += new TextEncoder().encode(text).byteLength;
+      state.fileCount++;
+      entry.files[rel] = { encoding: 'utf8', data: text };
+    }
+  }
+
+  async collectCopilotSecrets(dataText, bundle) {
+    let data;
+    try {
+      data = JSON.parse(dataText);
+    } catch (error) {
+      bundle.warnings.push('Copilot data.json 无法解析，未能读取 Keychain 密钥');
+      return;
+    }
+
+    const storage = this.app.secretStorage;
+    if (!storage || typeof storage.getSecret !== 'function') {
+      bundle.warnings.push(
+        '当前 Obsidian 不支持 SecretStorage，Copilot API Key 未包含（Obsidian 需 1.11.4+）'
+      );
+      return;
+    }
+
+    const candidates = new Map();
+    const providers =
+      data.providers && typeof data.providers === 'object' ? data.providers : {};
+    for (const [providerId, provider] of Object.entries(providers)) {
+      if (
+        provider &&
+        typeof provider.apiKeyKeychainId === 'string' &&
+        provider.apiKeyKeychainId
+      ) {
+        candidates.set(provider.apiKeyKeychainId, {
+          providerId,
+          providerName:
+            provider.displayName || provider.providerId || providerId,
+          source: 'provider',
+        });
+      }
+    }
+
+    const vaultId =
+      typeof data._keychainVaultId === 'string' ? data._keychainVaultId : '';
+    bundle.copilotVaultId = vaultId;
+
+    let availableIds = [];
+    if (typeof storage.listSecrets === 'function') {
+      try {
+        const listed = await Promise.resolve(storage.listSecrets());
+        availableIds = Array.isArray(listed) ? listed.map((id) => String(id)) : [];
+      } catch (error) {
+        bundle.warnings.push('无法枚举 Obsidian Keychain：' + (error.message || error));
+      }
+    }
+
+    if (vaultId) {
+      const prefix = 'copilot-v' + vaultId + '-';
+      for (const id of availableIds) {
+        if (id.startsWith(prefix)) {
+          const label = id.slice(prefix.length).replace(/-/g, ' ');
+          candidates.set(id, {
+            providerId: '',
+            providerName: 'Copilot ' + label,
+            source: 'vault-secret',
+          });
+        }
+      }
+      for (const field of LEGACY_COPILOT_SECRET_FIELDS) {
+        const id = legacyCopilotSecretId(vaultId, field);
+        if (id) {
+          candidates.set(id, {
+            providerId: '',
+            providerName: field,
+            source: 'legacy',
+          });
+        }
+      }
+    }
+
+    for (const [id, info] of candidates) {
+      try {
+        const value = await Promise.resolve(storage.getSecret(id));
+        if (typeof value === 'string' && value.length > 0) {
+          bundle.copilotSecrets.push({
+            providerId: info.providerId,
+            providerName: info.providerName,
+            source: info.source,
+            keychainId: id,
+            value,
+          });
+        }
+      } catch (error) {
+        bundle.warnings.push('读取 Copilot 密钥失败：' + id);
+      }
+    }
+
+    for (const field of LEGACY_COPILOT_SECRET_FIELDS) {
+      if (
+        typeof data[field] === 'string' &&
+        data[field].length > 0 &&
+        !bundle.detectedSecrets.some(
+          (item) => item.plugin === 'copilot' && item.path === field
+        )
+      ) {
+        bundle.detectedSecrets.push({
+          plugin: 'copilot',
+          path: field,
+          kind: 'plaintext',
+          length: data[field].length,
+        });
+      }
+    }
+  }
+
+  async collectPluginBackup(options) {
+    const opts = options || {};
+    const includePluginCode =
+      opts.includePluginCode !== undefined
+        ? !!opts.includePluginCode
+        : !!this.settings.backupIncludePluginCode;
+    const adapter = this.app.vault.adapter;
+    const bundle = {
+      format: BACKUP_FORMAT,
+      formatVersion: BACKUP_FORMAT_VERSION,
+      pluginVersion:
+        this.manifest && this.manifest.version
+          ? this.manifest.version
+          : PLUGIN_VERSION_FALLBACK,
+      createdAt: new Date().toISOString(),
+      vaultName:
+        this.app.vault && typeof this.app.vault.getName === 'function'
+          ? this.app.vault.getName()
+          : '',
+      includePluginCode,
+      excludedPlugins: [PLUGIN_ID],
+      plugins: [],
+      vaultConfig: {},
+      copilotSecrets: [],
+      detectedSecrets: [],
+      warnings: [],
+      stats: {},
+    };
+
+    const pluginRoot = '.obsidian/plugins';
+    let listing;
+    try {
+      listing = await adapter.list(pluginRoot);
+    } catch (error) {
+      throw new Error('无法读取 .obsidian/plugins：' + (error.message || error));
+    }
+
+    const folders = (listing.folders || []).filter(
+      (folder) => folder.split('/').pop() !== PLUGIN_ID
+    );
+    let copilotDataText = null;
+    const counters = { totalBytes: 0, fileCount: 0 };
+
+    for (const folder of folders) {
+      const id = folder.split('/').pop();
+      const entry = { id, folder, files: {} };
+      const dataText = await readAdapterText(adapter, folder + '/data.json');
+      const manifestText = await readAdapterText(adapter, folder + '/manifest.json');
+
+      if (dataText !== null) {
+        entry.files['data.json'] = { encoding: 'utf8', data: dataText };
+        counters.totalBytes += new TextEncoder().encode(dataText).byteLength;
+        counters.fileCount++;
+      }
+      if (manifestText !== null) {
+        entry.files['manifest.json'] = { encoding: 'utf8', data: manifestText };
+        counters.totalBytes += new TextEncoder().encode(manifestText).byteLength;
+        counters.fileCount++;
+      }
+      if (id === 'copilot' && dataText !== null) copilotDataText = dataText;
+
+      if (includePluginCode) {
+        await this.collectAllPluginFiles(
+          adapter,
+          folder,
+          entry,
+          counters,
+          bundle.warnings
+        );
+      } else {
+        await this.collectPluginConfigFiles(
+          adapter,
+          folder,
+          entry,
+          counters,
+          bundle.warnings
+        );
+      }
+
+      if (Object.keys(entry.files).length > 0) bundle.plugins.push(entry);
+
+      if (dataText !== null) {
+        try {
+          scanSecretFields(
+            JSON.parse(dataText),
+            id,
+            '',
+            bundle.detectedSecrets,
+            0
+          );
+        } catch (error) {
+          bundle.warnings.push(id + '/data.json 不是有效 JSON，无法扫描密钥字段');
+        }
+      }
+    }
+
+    for (const name of ['community-plugins.json', 'core-plugins.json']) {
+      const text = await readAdapterText(adapter, '.obsidian/' + name);
+      if (text !== null) {
+        bundle.vaultConfig[name] = { encoding: 'utf8', data: text };
+      }
+    }
+
+    if (copilotDataText !== null) {
+      await this.collectCopilotSecrets(copilotDataText, bundle);
+    } else {
+      bundle.warnings.push('未找到 Copilot 的 data.json，未读取 Copilot 密钥');
+    }
+
+    bundle.detectedSecrets = bundle.detectedSecrets.slice(0, 500);
+    bundle.stats = {
+      pluginCount: bundle.plugins.length,
+      fileCount: counters.fileCount,
+      totalBytes: counters.totalBytes,
+      copilotSecretCount: bundle.copilotSecrets.length,
+      detectedSecretCount: bundle.detectedSecrets.length,
+    };
+    return bundle;
+  }
+
+  async uploadEncryptedBackup(filename, text) {
+    const client = new WebDAVClient(this.settings);
+    await client.ensureRoot();
+    const folder = normalizeRelPath(
+      this.settings.backupFolder || DEFAULT_SETTINGS.backupFolder
+    );
+    await client.ensureDir(folder);
+    const path = folder ? folder + '/' + filename : filename;
+    const bytes = new TextEncoder().encode(text);
+    const data = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength
+    );
+    await client.put(path, data);
+    await this.pruneRemoteBackups(client, folder);
+    return path;
+  }
+
+  async pruneRemoteBackups(client, folder) {
+    const keep = Math.max(1, Math.floor(Number(this.settings.backupKeep) || 10));
+    let entries;
+    try {
+      entries = await client.list(folder);
+    } catch (error) {
+      if (error && error.status === 404) return;
+      throw error;
+    }
+    const backups = entries
+      .filter(
+        (entry) => !entry.isDir && /\.wdrsbackup$/i.test(entry.path)
+      )
+      .sort((a, b) => b.path.localeCompare(a.path));
+    for (const entry of backups.slice(keep)) {
+      try {
+        await client.deleteFile(entry.path);
+      } catch (error) {
+        console.warn('[WebDAVrSync] 清理旧备份失败：' + entry.path, error);
+      }
+    }
+  }
+
+  async listRemoteBackups() {
+    const client = new WebDAVClient(this.settings);
+    await client.ensureRoot();
+    const folder = normalizeRelPath(
+      this.settings.backupFolder || DEFAULT_SETTINGS.backupFolder
+    );
+    let entries;
+    try {
+      entries = await client.list(folder);
+    } catch (error) {
+      if (error && error.status === 404) {
+        return { client, folder, entries: [] };
+      }
+      throw error;
+    }
+    const backups = entries
+      .filter(
+        (entry) => !entry.isDir && /\.wdrsbackup$/i.test(entry.path)
+      )
+      .sort((a, b) => b.path.localeCompare(a.path));
+    return { client, folder, entries: backups };
+  }
+
+  async createEncryptedBackup() {
+    if (this.syncing) {
+      new Notice('WebDAVrSync：同步进行中，请等同步结束后再备份');
+      return { ok: false, error: '同步进行中' };
+    }
+    const passphrase = await promptPassphrase(this.app, {
+      title: '创建插件配置与密钥备份',
+      description:
+        '备份会读取所有插件的 data.json、manifest.json、其他配置文件，以及 Copilot 在 Obsidian Keychain 中的 API Key。' +
+        '整个备份使用 AES-256-GCM 加密；密码不会保存，请自行记牢。',
+      requireConfirm: true,
+      confirmLabel: '创建备份',
+      minLength: 8,
+    });
+    if (!passphrase.ok) return { ok: false, canceled: true };
+
+    try {
+      const bundle = await this.collectPluginBackup();
+      const envelope = await encryptBackupBundle(bundle, passphrase.password);
+      const text = JSON.stringify(envelope, null, 2);
+      const filename = this.backupFileName();
+      const localSaved = downloadTextFile(
+        filename,
+        text,
+        'application/octet-stream'
+      );
+
+      let remotePath = null;
+      let remoteError = '';
+      if (String(this.settings.serverUrl || '').trim()) {
+        try {
+          remotePath = await this.uploadEncryptedBackup(filename, text);
+        } catch (error) {
+          remoteError = error && error.message ? error.message : String(error);
+        }
+      }
+
+      if (!localSaved && !remotePath) {
+        throw new Error('既无法下载到本机，也无法上传到 WebDAV');
+      }
+
+      const size = new TextEncoder().encode(text).byteLength;
+      let message =
+        'WebDAVrSync 备份完成：插件 ' +
+        bundle.stats.pluginCount +
+        ' 个，文件 ' +
+        bundle.stats.fileCount +
+        ' 个，Copilot 密钥 ' +
+        bundle.stats.copilotSecretCount +
+        ' 条，大小 ' +
+        formatBytes(size);
+      if (localSaved) message += '；已下载到本机';
+      if (!String(this.settings.serverUrl || '').trim()) {
+        message += '；未配置 WebDAV，仅保存到本机';
+      }
+      if (remotePath) message += '；已上传到 ' + safeDecodeUri(remotePath);
+      if (remoteError) message += '；上传 WebDAV 失败：' + remoteError;
+      if (bundle.warnings.length) {
+        message += '；' + bundle.warnings.length + ' 条警告，详见 Console';
+      }
+      new Notice(message, 15000);
+      if (bundle.warnings.length) {
+        console.warn('[WebDAVrSync] 备份警告', bundle.warnings);
+      }
+      return {
+        ok: true,
+        filename,
+        remotePath,
+        localSaved,
+        stats: bundle.stats,
+        warnings: bundle.warnings,
+      };
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      new Notice('WebDAVrSync 备份失败：' + message, 12000);
+      console.error('[WebDAVrSync] 备份失败', error);
+      return { ok: false, error: message };
+    }
+  }
+
+  pickBackupFile(onText) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.wdrsbackup,.json,application/octet-stream';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    input.addEventListener('cancel', () => input.remove());
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      input.remove();
+      if (!file) return;
+      try {
+        if (file.size > 200 * 1024 * 1024) {
+          throw new Error('备份文件大于 200MB');
+        }
+        const text = await readFileText(file);
+        await onText(text);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        new Notice('WebDAVrSync 读取备份失败：' + message, 12000);
+        console.error('[WebDAVrSync] 读取备份失败', error);
+      }
+    });
+    input.click();
+  }
+
+  async decryptAndRestoreBackupText(text) {
+    let envelope;
+    try {
+      envelope = JSON.parse(String(text || '').trim());
+    } catch (error) {
+      throw new Error('不是有效的备份 JSON 文件');
+    }
+    const passphrase = await promptPassphrase(this.app, {
+      title: '解密插件备份',
+      description: '输入创建备份时使用的密码。',
+      requireConfirm: false,
+      confirmLabel: '解密并恢复',
+      minLength: 1,
+    });
+    if (!passphrase.ok) return { ok: false, canceled: true };
+
+    let bundle;
+    try {
+      bundle = await decryptBackupBundle(envelope, passphrase.password);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      new Notice('WebDAVrSync 解密失败：' + message, 12000);
+      return { ok: false, error: message };
+    }
+    return await this.restorePluginBackup(bundle);
+  }
+
+  async restoreFromLocalBackupFile() {
+    if (this.syncing) {
+      new Notice('WebDAVrSync：同步进行中，请等同步结束后再恢复');
+      return { ok: false, error: '同步进行中' };
+    }
+    this.pickBackupFile(async (text) => {
+      try {
+        await this.decryptAndRestoreBackupText(text);
+      } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        new Notice('WebDAVrSync 恢复失败：' + message, 12000);
+        console.error('[WebDAVrSync] 恢复失败', error);
+      }
+    });
+  }
+
+  async restoreFromRemoteBackup() {
+    if (this.syncing) {
+      new Notice('WebDAVrSync：同步进行中，请等同步结束后再恢复');
+      return { ok: false, error: '同步进行中' };
+    }
+    if (!String(this.settings.serverUrl || '').trim()) {
+      new Notice('WebDAVrSync：请先填写 WebDAV 地址');
+      return { ok: false, error: '未填写 WebDAV 地址' };
+    }
+    try {
+      const result = await this.listRemoteBackups();
+      if (!result.entries.length) {
+        new Notice(
+          'WebDAVrSync：远端备份文件夹中没有 .wdrsbackup 文件：' + result.folder,
+          8000
+        );
+        return { ok: false, error: '没有远端备份' };
+      }
+      const chosen = await promptBackupChoice(this.app, result.entries);
+      if (!chosen) return { ok: false, canceled: true };
+      const data = await result.client.get(chosen.path);
+      const text = new TextDecoder().decode(data);
+      return await this.decryptAndRestoreBackupText(text);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      new Notice('WebDAVrSync 读取远端备份失败：' + message, 12000);
+      console.error('[WebDAVrSync] 读取远端备份失败', error);
+      return { ok: false, error: message };
+    }
+  }
+
+  async backupExistingFile(adapter, path, stamp, warnings) {
+    if (!(await adapter.exists(path))) return;
+    try {
+      const data = await adapter.readBinary(path);
+      const backupPath = path + '.pre-restore-' + stamp + '.bak';
+      await adapter.writeBinary(backupPath, data);
+    } catch (error) {
+      warnings.push('无法备份原文件 ' + path + '：' + (error.message || error));
+      throw new Error('无法备份原文件，已停止恢复：' + path);
+    }
+  }
+
+  async writeBackupFile(adapter, path, file) {
+    if (!file || typeof file.data !== 'string') {
+      throw new Error('备份文件内容损坏：' + path);
+    }
+    let data;
+    if (file.encoding === 'base64') {
+      data = base64ToArrayBuffer(file.data);
+    } else {
+      const bytes = new TextEncoder().encode(file.data);
+      data = bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength
+      );
+    }
+    await adapter.writeBinary(path, data);
+  }
+
+  async restorePluginBackup(bundle, options) {
+    if (this.syncing) {
+      throw new Error('同步正在进行，请等同步结束后再恢复');
+    }
+    if (!bundle || bundle.format !== BACKUP_FORMAT) {
+      throw new Error('不是 WebDAVrSync 插件备份内容');
+    }
+    if (
+      bundle.formatVersion !== undefined &&
+      Number(bundle.formatVersion) > BACKUP_FORMAT_VERSION
+    ) {
+      throw new Error('备份内容版本过新，请升级 WebDAVrSync');
+    }
+
+    const opts = options || {};
+    const plugins = Array.isArray(bundle.plugins) ? bundle.plugins : [];
+    const secretCount = Array.isArray(bundle.copilotSecrets)
+      ? bundle.copilotSecrets.length
+      : 0;
+    const fileCount = plugins.reduce((count, plugin) => {
+      const files = (plugin && plugin.files) || {};
+      return (
+        count +
+        Object.keys(files).filter(
+          (rel) =>
+            !(normalizeRelPath(rel) === 'manifest.json' && !bundle.includePluginCode)
+        ).length
+      );
+    }, 0);
+
+    if (!opts.skipConfirm) {
+      const lines = [
+        '即将恢复 WebDAVrSync 插件备份：',
+        '',
+        '备份时间：' +
+          (bundle.createdAt
+            ? new Date(bundle.createdAt).toLocaleString()
+            : '未知'),
+        '插件数量：' + plugins.length + ' 个',
+        '文件数量：' + fileCount + ' 个',
+        '包含插件代码：' + (bundle.includePluginCode ? '是' : '否'),
+        'Copilot 密钥：' + secretCount + ' 条',
+        '',
+        '恢复会覆盖当前插件的 data.json 和其他配置；如备份包含插件代码，还会覆盖 manifest.json 和代码文件。',
+        '覆盖前会在同目录生成 .pre-restore-*.bak 备份。',
+        '恢复完成后建议重启 Obsidian。',
+        '',
+        '是否继续？',
+      ];
+      if (!window.confirm(lines.join('\n'))) {
+        return { ok: false, canceled: true };
+      }
+    }
+
+    const adapter = this.app.vault.adapter;
+    const stamp = timestampForName(new Date());
+    const warnings = [];
+    let restoredFiles = 0;
+    let restoredSecrets = 0;
+
+    for (const plugin of plugins) {
+      if (!plugin || !plugin.folder || plugin.id === PLUGIN_ID) continue;
+      const folder = normalizeRelPath(plugin.folder);
+      if (!/^\.obsidian\/plugins\/[^/]+$/.test(folder)) {
+        warnings.push('跳过非法插件路径：' + plugin.folder);
+        continue;
+      }
+      if (folder.split('/').pop() === PLUGIN_ID) continue;
+      for (const [rawRel, file] of Object.entries(plugin.files || {})) {
+        const rel = normalizeRelPath(rawRel);
+        if (!rel || rel.includes('..')) {
+          warnings.push('跳过非法文件路径：' + rawRel);
+          continue;
+        }
+        // A manifest without matching plugin code could make Obsidian believe
+        // the installed version is older/newer than it really is.
+        if (rel === 'manifest.json' && !bundle.includePluginCode) continue;
+        const path = folder + '/' + rel;
+        const parent = path.split('/').slice(0, -1).join('/');
+        await ensureAdapterDir(adapter, parent);
+        await this.backupExistingFile(adapter, path, stamp, warnings);
+        await this.writeBackupFile(adapter, path, file);
+        restoredFiles++;
+      }
+    }
+
+    if (secretCount > 0) {
+      const storage = this.app.secretStorage;
+      if (!storage || typeof storage.setSecret !== 'function') {
+        warnings.push(
+          '当前 Obsidian 不支持 SecretStorage，Copilot 密钥未恢复（需 1.11.4+）'
+        );
+      } else {
+        for (const secret of bundle.copilotSecrets) {
+          if (
+            !secret ||
+            typeof secret.keychainId !== 'string' ||
+            typeof secret.value !== 'string'
+          ) {
+            continue;
+          }
+          try {
+            await Promise.resolve(
+              storage.setSecret(secret.keychainId, secret.value)
+            );
+            restoredSecrets++;
+          } catch (error) {
+            warnings.push('恢复 Copilot 密钥失败：' + secret.keychainId);
+          }
+        }
+      }
+    }
+
+    if (warnings.length) {
+      console.warn('[WebDAVrSync] 恢复警告', warnings);
+    }
+    new Notice(
+      'WebDAVrSync 恢复完成：文件 ' +
+        restoredFiles +
+        ' 个，Copilot 密钥 ' +
+        restoredSecrets +
+        ' 条。请重启 Obsidian。',
+      15000
+    );
+    return {
+      ok: true,
+      restoredFiles,
+      restoredSecrets,
+      warnings,
+    };
+  }
+
   async resetSyncState() {
     const confirmed = window.confirm(
       '确定清空同步状态吗？\n\n不会删除任何文件，但下次同步会把两端所有文件重新比较一遍，文件多时可能较慢。'
@@ -1748,6 +2864,173 @@ class WebDAVrSyncPlugin extends Plugin {
     this.refreshStatus();
     new Notice('WebDAVrSync：同步状态已清空');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Backup UI modals
+// ---------------------------------------------------------------------------
+
+class PassphraseModal extends Modal {
+  constructor(app, options, resolve) {
+    super(app);
+    this.options = options || {};
+    this.resolve = resolve;
+    this.resolved = false;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h3', {
+      text: this.options.title || '加密备份密码',
+    });
+    if (this.options.description) {
+      contentEl.createEl('p', { text: this.options.description });
+    }
+
+    const password = contentEl.createEl('input');
+    password.type = 'password';
+    password.placeholder = '备份密码';
+    password.style.width = '100%';
+
+    let confirmation = null;
+    if (this.options.requireConfirm) {
+      confirmation = contentEl.createEl('input');
+      confirmation.type = 'password';
+      confirmation.placeholder = '再次输入密码';
+      confirmation.style.width = '100%';
+      confirmation.style.marginTop = '8px';
+    }
+
+    const error = contentEl.createEl('p');
+    error.style.color = 'var(--text-error)';
+    error.style.minHeight = '1.2em';
+
+    const buttons = contentEl.createDiv({ cls: 'modal-button-container' });
+    const okButton = buttons.createEl('button', {
+      text: this.options.confirmLabel || '确定',
+      cls: 'mod-cta',
+    });
+    const cancelButton = buttons.createEl('button', { text: '取消' });
+
+    const submit = () => {
+      const value = password.value;
+      const minLength = Number(this.options.minLength) || 1;
+      if (value.trim().length < minLength) {
+        error.setText('密码至少 ' + minLength + ' 个字符');
+        return;
+      }
+      if (confirmation && confirmation.value !== value) {
+        error.setText('两次输入的密码不一致');
+        return;
+      }
+      if (this.resolved) return;
+      this.resolved = true;
+      this.resolve({ ok: true, password: value });
+      this.close();
+    };
+
+    okButton.onclick = submit;
+    cancelButton.onclick = () => {
+      if (this.resolved) return;
+      this.resolved = true;
+      this.resolve({ ok: false });
+      this.close();
+    };
+    password.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') submit();
+    });
+    if (confirmation) {
+      confirmation.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') submit();
+      });
+    }
+    window.setTimeout(() => {
+      try {
+        password.focus();
+      } catch (error) {
+        // Ignore focus failure.
+      }
+    }, 50);
+  }
+
+  onClose() {
+    if (!this.resolved && this.resolve) {
+      this.resolved = true;
+      this.resolve({ ok: false });
+    }
+    this.contentEl.empty();
+  }
+}
+
+function promptPassphrase(app, options) {
+  return new Promise((resolve) => {
+    new PassphraseModal(app, options, resolve).open();
+  });
+}
+
+class BackupListModal extends Modal {
+  constructor(app, entries, resolve) {
+    super(app);
+    this.entries = entries || [];
+    this.resolve = resolve;
+    this.resolved = false;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h3', { text: '选择要恢复的远程备份' });
+    contentEl.createEl('p', {
+      text: '按文件名从新到旧排列；列出的是 WebDAV 备份文件夹中的 .wdrsbackup 文件。',
+    });
+
+    for (const entry of this.entries) {
+      const name = entry.path.split('/').pop();
+      const pieces = [name];
+      if (entry.mtime) {
+        pieces.push(new Date(entry.mtime).toLocaleString());
+      }
+      if (entry.size) pieces.push(formatBytes(entry.size));
+      const button = contentEl.createEl('button', {
+        text: pieces.join('  ·  '),
+        cls: 'mod-cta',
+      });
+      button.style.display = 'block';
+      button.style.width = '100%';
+      button.style.marginBottom = '6px';
+      button.style.textAlign = 'left';
+      button.onclick = () => {
+        if (this.resolved) return;
+        this.resolved = true;
+        this.resolve(entry);
+        this.close();
+      };
+    }
+
+    const cancel = contentEl.createEl('button', { text: '取消' });
+    cancel.style.marginTop = '8px';
+    cancel.onclick = () => {
+      if (this.resolved) return;
+      this.resolved = true;
+      this.resolve(null);
+      this.close();
+    };
+  }
+
+  onClose() {
+    if (!this.resolved && this.resolve) {
+      this.resolved = true;
+      this.resolve(null);
+    }
+    this.contentEl.empty();
+  }
+}
+
+function promptBackupChoice(app, entries) {
+  return new Promise((resolve) => {
+    new BackupListModal(app, entries, resolve).open();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1982,6 +3265,100 @@ class WebDAVrSyncSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl).setName('插件配置与密钥备份（加密）').setHeading();
+
+    new Setting(containerEl)
+      .setName('备份文件夹')
+      .setDesc(
+        'WebDAV 上的相对路径，默认 .webdavrsync-backups。该目录由备份功能管理，' +
+          '普通同步不会把它拉回本地。'
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder('.webdavrsync-backups')
+          .setValue(plugin.settings.backupFolder)
+          .onChange(async (value) => {
+            plugin.settings.backupFolder =
+              value.trim() || DEFAULT_SETTINGS.backupFolder;
+            await plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('保留备份数量')
+      .setDesc('上传到 WebDAV 后只保留最近的 N 个备份，范围 1–100。')
+      .addText((text) => {
+        text.inputEl.type = 'number';
+        text.inputEl.min = '1';
+        text.inputEl.max = '100';
+        text
+          .setValue(String(plugin.settings.backupKeep || 10))
+          .onChange(async (value) => {
+            plugin.settings.backupKeep = Math.max(
+              1,
+              Math.min(100, Number(value) || 10)
+            );
+            await plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('备份时包含插件代码')
+      .setDesc(
+        '关闭：只备份 data.json、manifest.json 和其他配置文件，体积小。' +
+          '开启：连 main.js、styles.css 等插件代码一起备份，体积可能几十 MB。'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(!!plugin.settings.backupIncludePluginCode)
+          .onChange(async (value) => {
+            plugin.settings.backupIncludePluginCode = value;
+            await plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('立即创建加密备份')
+      .setDesc(
+        '读取所有插件的配置文件、Copilot 在 Obsidian Keychain 中的 API Key，' +
+          '以及其他插件 data.json 里的明文 token/key。' +
+          '备份使用 AES-256-GCM 加密，密码不会保存；忘记密码将无法恢复。'
+      )
+      .addButton((button) =>
+        button
+          .setButtonText('创建备份')
+          .setCta()
+          .onClick(async () => {
+            button.setDisabled(true);
+            button.setButtonText('备份中…');
+            await plugin.createEncryptedBackup();
+            button.setDisabled(false);
+            button.setButtonText('创建备份');
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('从本地文件恢复')
+      .setDesc('选择本机下载的 .wdrsbackup 文件，输入备份密码后恢复。')
+      .addButton((button) =>
+        button.setButtonText('选择文件').onClick(() => {
+          plugin.restoreFromLocalBackupFile();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('从 WebDAV 恢复')
+      .setDesc('列出远端备份文件夹中的 .wdrsbackup，选择后输入密码恢复。')
+      .addButton((button) =>
+        button.setButtonText('选择远程备份').onClick(async () => {
+          button.setDisabled(true);
+          button.setButtonText('读取中…');
+          await plugin.restoreFromRemoteBackup();
+          button.setDisabled(false);
+          button.setButtonText('选择远程备份');
+        })
+      );
+
     new Setting(containerEl).setName('操作').setHeading();
 
     new Setting(containerEl)
@@ -2034,7 +3411,14 @@ module.exports.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports.DEFAULT_IGNORE_TEXT = DEFAULT_IGNORE_TEXT;
 module.exports.CONFIG_FORMAT = CONFIG_FORMAT;
 module.exports.CONFIG_FORMAT_VERSION = CONFIG_FORMAT_VERSION;
+module.exports.BACKUP_FORMAT = BACKUP_FORMAT;
+module.exports.BACKUP_FILE_FORMAT = BACKUP_FILE_FORMAT;
+module.exports.BACKUP_FORMAT_VERSION = BACKUP_FORMAT_VERSION;
 module.exports.normalizeSettings = normalizeSettings;
 module.exports.parseConfigImport = parseConfigImport;
+module.exports.encryptBackupBundle = encryptBackupBundle;
+module.exports.decryptBackupBundle = decryptBackupBundle;
+module.exports.scanSecretFields = scanSecretFields;
+module.exports.legacyCopilotSecretId = legacyCopilotSecretId;
 module.exports.compileIgnore = compileIgnore;
 module.exports.formatSummary = formatSummary;

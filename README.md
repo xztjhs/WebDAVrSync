@@ -22,6 +22,7 @@
 - 中文、空格、特殊字符路径按 URL 编码处理。
 - 状态栏显示同步进度，点击状态栏可立即同步。
 - 配置导出 / 导入：可导出含密码或不含密码的 JSON，在另一台机器快速恢复设置。
+- 加密插件配置与密钥备份：包含所有插件 `data.json`、其他配置文件、Copilot Keychain API Key，以及其他插件明文 token/key。
 - 详细图文步骤见 [使用手册.md](使用手册.md)。
 
 ## 安装
@@ -103,6 +104,59 @@
 
 导入后请先点“测试连接”，确认无误再点“立即同步”。
 
+## 插件配置与密钥备份（加密）
+
+普通的 `.obsidian` 同步会复制各插件的 `data.json`，但 **Copilot 的模型 API Key
+不在 `data.json` 里**：当前 Copilot 使用 Obsidian 的 OS Keychain / SecretStorage，
+`data.json` 只保存 `apiKeyKeychainId` 引用。因此新增一个独立的加密备份功能。
+
+在插件设置最下方“插件配置与密钥备份（加密）”中：
+
+- **立即创建加密备份**
+  - 读取所有插件（不含 WebDAVrSync 自己）的 `data.json`、`manifest.json`，
+    以及 `.json` / `.yaml` / `.toml` / `.ini` / `.conf` / `.env` / `.txt` 等配置文件；
+  - 其他插件明文写在 `data.json` 里的 token / key 会随配置文件一起进入备份；
+  - 读取 Copilot 在 Obsidian Keychain 中的密钥，包括 provider 的
+    `apiKeyKeychainId` 和 `copilot-v<vaultId>-...` 形式的模型/旧版密钥；
+  - 可选“备份时包含插件代码”（`main.js`、`styles.css` 等）；
+  - 使用 **AES-256-GCM + PBKDF2-SHA256（210,000 次）** 加密；
+  - 备份文件同时下载到本机，并上传到 WebDAV 的
+    `.webdavrsync-backups/` 文件夹（可在设置中修改，默认保留最近 10 个）；
+  - 密码不会保存；忘记密码无法恢复。
+- **从本地文件恢复**
+  - 选择 `.wdrsbackup` 文件，输入密码，恢复插件配置和 Copilot 密钥。
+- **从 WebDAV 恢复**
+  - 列出远端备份文件夹中的 `.wdrsbackup`，选择后输入密码恢复。
+
+恢复时会：
+
+- 覆盖对应插件的 `data.json` / 其他配置文件；如果备份包含插件代码，也会覆盖
+  `manifest.json` 和代码文件（不包含代码时不恢复 `manifest.json`，避免版本不一致）；
+- 覆盖前在每个文件旁生成 `.pre-restore-*.bak`（该模式已加入同步忽略，不会上传）；
+- 把 Copilot 密钥写回 Obsidian Keychain；
+- 备份中会记录 `community-plugins.json` / `core-plugins.json` 供参考，
+  但恢复时**不覆盖**这两个启用列表，避免改变当前 Obsidian 的插件启用状态；
+- 完成后建议重启 Obsidian。
+
+本功能不包含：
+
+- WebDAVrSync 自己的 `data.json`（用“配置导出”备份它）；
+- 其他插件使用 SecretStorage / IndexedDB / localStorage 保存、且未在
+  `data.json` 中留下引用的密钥；
+- 插件之外的数据（笔记本身仍由普通同步处理；Copilot 保存成 Markdown 的聊天记录
+  也属于笔记）。
+
+不包含插件代码时，目标机器应先安装相同或兼容版本的插件；需要完整迁移插件版本时，
+可开启“备份时包含插件代码”。
+
+> 备份密码只存在于你的记忆中。忘记密码时，备份文件无法解密。
+> 备份文件虽然经过加密，仍建议放在可信的 WebDAV 服务器上，并使用 HTTPS。
+
+> **注意：** 加密备份不会改变普通 `.obsidian` 同步的行为。当前 `syncConfig` 开启时，
+> 各插件的 `data.json` 仍会以明文同步到 WebDAV。如果不希望明文上传插件配置，
+> 请关闭“同步 .obsidian 配置”，或把 `.obsidian/plugins/*/data.json` 加入忽略规则，
+> 然后使用本加密备份恢复插件配置和密钥。
+
 ## 同步逻辑
 
 插件在 `data.json` 中维护一份“文件对照表”，记录每个文件上次同步时的：
@@ -128,7 +182,8 @@
 
 - 空文件夹（只同步文件；有文件的目录会自动创建）。
 - 默认忽略：`.obsidian/workspace.json`、`.obsidian/workspace-mobile.json`、
-  `.trash/`、任意层级的 `.git/` 与 `node_modules/`、`.DS_Store`、`Thumbs.db`、`*.tmp`。
+  `.trash/`、`.webdavrsync-backups/`、`*.pre-restore-*.bak`、任意层级的 `.git/`
+  与 `node_modules/`、`.DS_Store`、`Thumbs.db`、`*.tmp`。
 - 本插件目录 `.obsidian/plugins/webdavrsync/`（无论是否同步 `.obsidian`）。
 - 匹配“忽略规则”的路径。
 
@@ -176,10 +231,12 @@ bun test tests/sync.test.js
 ```
 
 测试会启动一个内存 WebDAV 服务器和一个模拟的 Obsidian `DataAdapter`，
-覆盖上传、下载、冲突、删除、忽略规则、中文路径、配置导出导入等场景。
+覆盖上传、下载、冲突、删除、忽略规则、中文路径、配置导出导入、加密备份/恢复等场景。
 
 ## 版本历史
 
+- **1.2.0**（2026-10-26）：新增加密插件配置与密钥备份；包含 Copilot Keychain API Key、
+  其他插件明文 token/key；支持本地/WebDAV 恢复。
 - **1.1.0**（2026-10-26）：新增配置导出 / 导入；连接失败提示更明确；补充使用手册。
 - **1.0.0**（2026-10-25）：首个版本，双向同步、冲突副本、定时/自动同步、忽略规则。
 
@@ -196,7 +253,9 @@ MIT，见 [LICENSE](LICENSE)。
 WebDAVrSync is a small, dependency-free, MIT-licensed Obsidian plugin that
 synchronizes a vault with any standard WebDAV server. It supports manual,
 interval, startup and change-triggered syncs, two-way deletion propagation,
-conflict copies, ignore globs, optional `.obsidian` config sync, and JSON
-config export/import. The plugin folder itself is always excluded because
-`data.json` contains the WebDAV password. No build step is required: copy the
-folder into `<vault>/.obsidian/plugins/webdavrsync/` and enable it.
+conflict copies, ignore globs, optional `.obsidian` config sync, JSON
+config export/import, and an encrypted plugin-config/secrets backup that
+includes Copilot Keychain API keys and plaintext plugin tokens. The plugin
+folder itself is always excluded because `data.json` contains the WebDAV
+password. No build step is required: copy the folder into
+`<vault>/.obsidian/plugins/webdavrsync/` and enable it.
