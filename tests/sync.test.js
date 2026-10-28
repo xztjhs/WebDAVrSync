@@ -989,6 +989,76 @@ describe('WebDAVrSync', () => {
     expect(server.getFile('vault/.trash/deleted.md')).toBeUndefined();
   });
 
+  it('回收站存档：本地清空回收站不会删除远端副本', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.writeText('.trash/a.md', 'trashed');
+    const settings = makeSettings(server);
+    const state = newState();
+
+    const first = await runSync(adapter, settings, state);
+    expect(first.summary.uploaded).toBe(1);
+    expect(server.getFile('vault/.trash/a.md')).toBeTruthy();
+
+    // 用户在本地清空回收站
+    await adapter.remove('.trash/a.md');
+    const second = await runSync(adapter, settings, state);
+
+    expect(second.summary.errors).toEqual([]);
+    expect(second.summary.deletedRemote).toBe(0);
+    expect(server.getFile('vault/.trash/a.md')).toBeTruthy();
+    expect(adapter.files()).not.toContain('.trash/a.md');
+  });
+
+  it('回收站存档：远端缺失时会从本地补回', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.writeText('.trash/b.md', 'trashed b');
+    const settings = makeSettings(server);
+    const state = newState();
+
+    await runSync(adapter, settings, state);
+    expect(server.getFile('vault/.trash/b.md')).toBeTruthy();
+
+    // 模拟远端存档里这一份被删掉
+    server.entries.delete('vault/.trash/b.md');
+    const second = await runSync(adapter, settings, state);
+
+    expect(second.summary.deletedLocal).toBe(0);
+    expect(second.summary.uploaded).toBe(1);
+    expect(server.getFile('vault/.trash/b.md')).toBeTruthy();
+  });
+
+  it('回收站存档：其他设备新增的回收站文件仍会下载', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    server.setFile('vault/.trash/from-other.md', 'from other device');
+    const settings = makeSettings(server);
+    const state = newState();
+
+    const result = await runSync(adapter, settings, state);
+
+    expect(result.summary.downloaded).toBe(1);
+    expect(adapter.readText('.trash/from-other.md')).toBe('from other device');
+  });
+
+  it('回收站存档：关闭 syncTrash 时不生效（回收站整体不同步）', async () => {
+    const server = new MockDavServer();
+    servers.push(server);
+    const adapter = new MemoryAdapter();
+    await adapter.writeText('.trash/c.md', 'trashed c');
+    const settings = makeSettings(server, { syncTrash: false });
+    const state = newState();
+
+    const result = await runSync(adapter, settings, state);
+
+    expect(result.summary.uploaded).toBe(0);
+    expect(server.getFile('vault/.trash/c.md')).toBeUndefined();
+  });
+
   it('忽略规则里的 .trash 写法不会覆盖“同步回收站”开关', () => {
     const on = compileIgnore({ syncTrash: true, ignoreText: '.trash/**' });
     expect(on('.trash/x.md')).toBe(false);

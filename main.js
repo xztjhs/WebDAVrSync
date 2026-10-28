@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * WebDAVrSync 1.2.1
+ * WebDAVrSync 1.2.2
  * A small, dependency-free, open-source Obsidian plugin that synchronizes a
  * vault with any WebDAV server that supports PROPFIND / PUT / GET / MKCOL /
  * DELETE (for example SFTPGo, Nextcloud, ownCloud, Apache mod_dav, nginx-dav).
@@ -24,7 +24,7 @@ const {
 } = require('obsidian');
 
 const PLUGIN_ID = 'webdavrsync';
-const PLUGIN_VERSION_FALLBACK = '1.2.1';
+const PLUGIN_VERSION_FALLBACK = '1.2.2';
 const STATE_VERSION = 1;
 const CONFIG_FORMAT = 'webdavrsync-config';
 const CONFIG_FORMAT_VERSION = 1;
@@ -298,6 +298,12 @@ function isTrashPattern(pattern) {
     .replace(/^\.\//, '')
     .replace(/\/+$/, '');
   return p === '.trash' || p === '.trash/*' || p === '.trash/**';
+}
+
+// 判断某个仓库相对路径是否位于回收站内。
+function isTrashPath(path) {
+  const p = normalizeRelPath(path);
+  return p === '.trash' || p.startsWith('.trash/');
 }
 
 function compileIgnore(settings) {
@@ -1153,6 +1159,10 @@ class SyncEngine {
     this.trashLocal = options.trashLocal || ((path) => this.adapter.remove(path));
     this.log = options.log || (() => {});
     this.isIgnored = compileIgnore(options.settings);
+    // 回收站存档模式：syncTrash 开启时，.trash 只增不删。
+    // 清空本地回收站不会删掉远端备份，远端缺失时反而会用本地补回去。
+    this.trashArchive = options.settings.syncTrash !== false;
+    this.trashKept = 0;
     this.isAliasPath = () => false;
     this.localAliasDirs = new Set();
     this.localDirs = new Set();
@@ -1173,6 +1183,7 @@ class SyncEngine {
 
   async run() {
     const started = Date.now();
+    this.trashKept = 0;
     // Use a null-prototype map so a vault file literally named "__proto__"
     // cannot mutate the state object's prototype.
     const safeFiles = Object.create(null);
@@ -1299,6 +1310,12 @@ class SyncEngine {
       for (const dir of aliasDirs) {
         this.log('已跳过目录软链接（远端同名副本保持原样）：' + dir);
       }
+    }
+
+    if (this.trashKept > 0) {
+      this.log(
+        '回收站存档：' + this.trashKept + ' 个远端副本按“只增不删”保留（本地已清空）'
+      );
     }
 
     this.state.version = STATE_VERSION;
@@ -1464,6 +1481,26 @@ class SyncEngine {
     if (!localEntry && !remoteEntry) {
       if (stateEntry) delete this.state.files[path];
       return;
+    }
+
+    // 回收站存档模式（syncTrash 开启时）：.trash 只增不删。
+    // 本地清空回收站 → 远端备份保留；远端缺了 → 用本地补回去。
+    if (this.trashArchive && isTrashPath(path)) {
+      if (!localEntry && remoteEntry) {
+        if (!stateEntry) {
+          // 另一台设备新放进回收站的文件，照常下载
+          await this.download(path, remoteEntry, null, null);
+        } else {
+          // 本地已清空：远端副本保留，也不把它当成新文件重新拉回本地
+          this.trashKept++;
+        }
+        return;
+      }
+      if (localEntry && !remoteEntry) {
+        this.log('回收站存档：从本地补回远端副本 ' + path);
+        await this.upload(path, localEntry);
+        return;
+      }
     }
 
     if (localEntry && remoteEntry) {

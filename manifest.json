@@ -1,7 +1,7 @@
-{
+﻿{
   "id": "webdavrsync",
   "name": "WebDAVrSync",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "minAppVersion": "1.4.0",
   "description": "轻量、开源的双向同步插件：本地 Obsidian 仓库 <-> 任意 WebDAV 服务器。",
   "author": "WebDAVrSync contributors",
