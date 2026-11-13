@@ -2,6 +2,17 @@
 
 All notable changes to WebDAVrSync are documented in this file.
 
+## 1.2.3 — 2026-11-14
+
+### Changed
+
+- **文档合规（面向 Obsidian 社区目录审核）**
+  - README 改为英文在前、中文在后：新增完整的 English 章节（功能、安装、依赖、
+    注意事项、联系方式），原中文内容保留在「中文说明」下。社区目录要求 README
+    必须包含英文说明。
+  - 新增 `CONTRIBUTING.md`：问题反馈信息清单、开发与测试方法、PR 约定、发布清单。
+- 本次仅文档变更，插件行为与 1.2.2 完全一致（`main.js` 只更新了版本号常量）。
+
 ## 1.2.2 — 2026-10-29
 
 ### Changed

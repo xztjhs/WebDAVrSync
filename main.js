@@ -1,7 +1,7 @@
 'use strict';
 
 /*
- * WebDAVrSync 1.2.2
+ * WebDAVrSync 1.2.3
  * A small, dependency-free, open-source Obsidian plugin that synchronizes a
  * vault with any WebDAV server that supports PROPFIND / PUT / GET / MKCOL /
  * DELETE (for example SFTPGo, Nextcloud, ownCloud, Apache mod_dav, nginx-dav).
@@ -24,7 +24,7 @@ const {
 } = require('obsidian');
 
 const PLUGIN_ID = 'webdavrsync';
-const PLUGIN_VERSION_FALLBACK = '1.2.2';
+const PLUGIN_VERSION_FALLBACK = '1.2.3';
 const STATE_VERSION = 1;
 const CONFIG_FORMAT = 'webdavrsync-config';
 const CONFIG_FORMAT_VERSION = 1;

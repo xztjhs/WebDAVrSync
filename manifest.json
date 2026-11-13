@@ -1,7 +1,7 @@
 {
   "id": "webdavrsync",
   "name": "WebDAVrSync",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "minAppVersion": "1.4.0",
   "description": "轻量双向 WebDAV 同步：回收站只增不删存档、插件配置与密钥加密备份。Lightweight two-way WebDAV sync with append-only trash archive and encrypted config/keychain backup.",
   "author": "撞强",
