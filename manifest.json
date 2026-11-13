@@ -3,8 +3,8 @@
   "name": "WebDAVrSync",
   "version": "1.2.2",
   "minAppVersion": "1.4.0",
-  "description": "轻量、开源的双向同步插件：本地 Obsidian 仓库 <-> 任意 WebDAV 服务器。",
-  "author": "WebDAVrSync contributors",
-  "authorUrl": "",
-  "isDesktopOnly": false
+  "description": "轻量双向 WebDAV 同步：回收站只增不删存档、插件配置与密钥加密备份。Lightweight two-way WebDAV sync with append-only trash archive and encrypted config/keychain backup.",
+  "author": "撞强",
+  "authorUrl": "https://github.com/xztjhs",
+  "isDesktopOnly": true
 }

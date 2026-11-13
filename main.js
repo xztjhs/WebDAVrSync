@@ -3299,10 +3299,10 @@ class WebDAVrSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('WebDAV 地址')
-      .setDesc('示例：http://192.168.254.253:1080（可省略 http://）')
+      .setDesc('示例：https://dav.example.com（可省略 http://）')
       .addText((text) =>
         text
-          .setPlaceholder('http://192.168.254.253:1080')
+          .setPlaceholder('https://dav.example.com')
           .setValue(plugin.settings.serverUrl)
           .onChange(async (value) => {
             plugin.settings.serverUrl = value.trim();

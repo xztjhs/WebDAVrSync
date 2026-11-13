@@ -2,6 +2,8 @@
 
 一个轻量、开源、免费的 Obsidian 双向同步插件。只使用 WebDAV，不依赖 S3、Dropbox、OneDrive 等任何专有服务。
 
+作者：**撞强** · <app@pcd.name> · <https://github.com/xztjhs>
+
 > **重要：** 如果本仓库仍启用了 Remotely Save 或其他同步插件，请先停用它们。
 > 两个同步插件同时写同一批文件会造成冲突。
 
@@ -76,7 +78,7 @@
 
 | 设置 | 说明 |
 | --- | --- |
-| WebDAV 地址 | 例如 `http://192.168.254.253:1080`，可省略 `http://` |
+| WebDAV 地址 | 例如 `https://dav.example.com`，可省略 `http://` |
 | 用户名 / 密码 | HTTP Basic Auth 凭据 |
 | 远程根目录 | `/` 表示账号根目录；`/obsidian` 表示同步到该子目录（不存在会自动创建） |
 | 设备名称 | 仅用于冲突文件名，例如 `PC`、`Laptop` |
@@ -257,25 +259,33 @@ bun test tests/sync.test.js
 
 ## 仓库与版本
 
-- Gitea 仓库：<http://192.168.254.253:60006/admin/WebDAVrSync>
-- Releases 页面提供每个版本的插件包（`.zip`）与说明：
-  <http://192.168.254.253:60006/admin/WebDAVrSync/releases>
-- 版本标签：`v1.0.0`、`v1.1.0`、`v1.2.0`、`v1.2.1`、`v1.2.2`
+- GitHub 仓库：<https://github.com/xztjhs/WebDAVrSync>
+- Releases 页面提供每个版本的 `main.js`、`manifest.json` 与说明：
+  <https://github.com/xztjhs/WebDAVrSync/releases>
+- 版本标签：`1.0.0`、`1.1.0`、`1.2.0`、`1.2.1`、`1.2.2`
 
 安装（其他机器）：
 
-1. 在 Releases 下载对应版本的 `WebDAVrSync-<版本>.zip`；
-2. 解压后把 `webdavrsync` 文件夹复制到 `<仓库>/.obsidian/plugins/`；
+1. 新建 `<仓库>/.obsidian/plugins/webdavrsync/`；
+2. 从 Releases 下载 `main.js` 和 `manifest.json`（如果发布里有 `styles.css` 也一并下载）放进去；
 3. 重启 Obsidian，在“第三方插件”里启用 WebDAVrSync。
 
 也可以直接克隆源码：
 
 ```bash
-git clone http://192.168.254.253:60006/admin/WebDAVrSync.git
+git clone https://github.com/xztjhs/WebDAVrSync.git
 # 把仓库内容复制到 <仓库>/.obsidian/plugins/webdavrsync/
 ```
 
 源码仓库包含全部历史版本与 `tests/sync.test.js`（需要 [Bun](https://bun.sh) 运行）。
+
+## 联系作者
+
+- 作者：**撞强**
+- 邮箱：<app@pcd.name>
+- GitHub：<https://github.com/xztjhs>
+
+问题反馈、功能建议欢迎提 Issue，或直接发邮件。
 
 ## 许可证
 

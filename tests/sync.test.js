@@ -728,7 +728,7 @@ function makeConfigPlugin() {
   plugin.settings = normalizeSettings({
     ...DEFAULT_SETTINGS,
     serverUrl: 'http://old.example:1080',
-    username: 'obsidian',
+    username: 'tester',
     password: 'secret',
     remoteRoot: '/',
     syncIntervalMinutes: 0,
