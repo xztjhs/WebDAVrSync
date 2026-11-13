@@ -1,5 +1,83 @@
 # WebDAVrSync
 
+**WebDAVrSync** — lightweight, dependency-free two-way WebDAV sync for Obsidian.
+
+Author: **撞强** · <app@pcd.name> · <https://github.com/xztjhs>
+
+[English](#english) · [中文说明](#中文说明)
+
+## English
+
+**WebDAVrSync** synchronizes your Obsidian vault with any standard WebDAV server
+(Nextcloud, ownCloud, SFTPGo, Apache mod_dav, nginx-dav, …). It is a single
+`main.js` file: no build step, no third-party runtime dependency, MIT licensed.
+
+### Highlights
+
+- **Two-way sync** — upload, download and delete between the vault and the server.
+- **Append-only trash archive** — `.trash` is backed up and is *never* deleted by
+  emptying your local trash. If a copy disappears from the server it is restored
+  from the local vault, so the recycle bin works as a real safety net for
+  deleted content.
+- **Encrypted plugin config and secrets backup** — collects every plugin's
+  `data.json`, `manifest.json` and other configuration files, plus Copilot's API
+  keys from the Obsidian Keychain, encrypts them with AES-256-GCM +
+  PBKDF2-SHA256 (210,000 iterations) and uploads a `.wdrsbackup` file to
+  `.webdavrsync-backups/` on your WebDAV server.
+- **Conflict safety** — both versions are kept by default, as
+  `name (conflict YYYYMMDD-HHMMSS device).ext`. A "keep newest" strategy is also
+  available.
+- **Selective sync** — optional `.obsidian` configuration sync, optional mirroring
+  of empty directories, and glob-based ignore rules.
+- **Byte-level verification** of same-size files on the first sync, so identical
+  files on both sides are not reported as conflicts.
+- **Flexible triggers** — manual, interval, on start, and a few seconds after you
+  stop editing. The status bar shows progress and can be clicked to sync now.
+- **Config export / import** with or without the WebDAV password, to set up
+  another machine quickly.
+
+### Install
+
+1. Open **Settings → Community plugins → Browse**, search for **WebDAVrSync**,
+   install and enable it.
+2. Open the plugin settings and fill in the WebDAV URL, username and password.
+3. Click **Test connection**, then **Sync now**.
+
+Manual install: download `main.js` and `manifest.json` from the
+[latest release](https://github.com/xztjhs/WebDAVrSync/releases), put them in
+`<vault>/.obsidian/plugins/webdavrsync/` and enable the plugin in
+Settings → Community plugins.
+
+### Requirements
+
+- Obsidian 1.4.0 or newer.
+- A WebDAV server that supports `PROPFIND`, `PUT`, `GET`, `MKCOL`, `DELETE` and
+  HTTP Basic Auth.
+- Desktop only for now. Mobile support depends on whether the mobile
+  `requestUrl` implementation allows custom methods such as `PROPFIND`; it has
+  not been verified yet.
+
+### Notes
+
+- Your WebDAV password is stored in plain text in this plugin's own `data.json`.
+  That folder is always excluded from sync.
+- The plugin does not implement a cross-device lock. Avoid editing the same file
+  on two devices at the same time; the default "keep both" strategy preserves
+  both versions.
+
+### Contact
+
+- Author: **撞强**
+- Email: <app@pcd.name>
+- Issues and feature requests:
+  <https://github.com/xztjhs/WebDAVrSync/issues>
+
+Licensed under the [MIT License](LICENSE).
+
+---
+
+## 中文说明
+
 一个轻量、开源、免费的 Obsidian 双向同步插件。只使用 WebDAV，不依赖 S3、Dropbox、OneDrive 等任何专有服务。
 
 作者：**撞强** · <app@pcd.name> · <https://github.com/xztjhs>
@@ -293,14 +371,4 @@ MIT，见 [LICENSE](LICENSE)。
 
 ---
 
-## English summary
-
-WebDAVrSync is a small, dependency-free, MIT-licensed Obsidian plugin that
-synchronizes a vault with any standard WebDAV server. It supports manual,
-interval, startup and change-triggered syncs, two-way deletion propagation,
-conflict copies, ignore globs, optional `.obsidian` config sync, JSON
-config export/import, and an encrypted plugin-config/secrets backup that
-includes Copilot Keychain API keys and plaintext plugin tokens. The plugin
-folder itself is always excluded because `data.json` contains the WebDAV
-password. No build step is required: copy the folder into
-`<vault>/.obsidian/plugins/webdavrsync/` and enable it.
+文档与代码同样使用 MIT 许可证。英文说明见上方的 [English](#english) 一节。
